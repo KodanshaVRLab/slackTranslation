@@ -48,15 +48,24 @@ function verifySlackSignature(req, rawBody) {
   }
 }
 
-function protectSlackTokens(text) {
-  return text.replace(
+// Slack tokens like <@U123>, <#C123>, <https://…> are not valid XML,
+// so they can't be sent to DeepL as-is with tag_handling: "xml".
+// Instead, pull them out and replace with self-closing placeholder tags,
+// then restore them after translation.
+function extractSlackTokens(text) {
+  const tokens = [];
+  const replaced = text.replace(
     /(<[@#!][^>]+>|<https?:[^>]+>|:[a-z0-9_+-]+:)/gi,
-    "<x>$1</x>"
+    (match) => {
+      tokens.push(match);
+      return `<x id="${tokens.length - 1}"/>`;
+    }
   );
+  return { replaced, tokens };
 }
 
-function unprotectSlackTokens(text) {
-  return text.replace(/<\/?x>/g, "");
+function restoreSlackTokens(text, tokens) {
+  return text.replace(/<x id="(\d+)"\s*\/>/g, (_, i) => tokens[Number(i)] ?? "");
 }
 
 async function translate(text, targetLang) {
@@ -108,8 +117,10 @@ async function handleMessage(event) {
   const targetLang = isJapanese ? "EN-US" : "JA";
   const flag = isJapanese ? "🇬🇧" : "🇯🇵";
 
-  const translated = unprotectSlackTokens(
-    await translate(protectSlackTokens(text), targetLang)
+  const { replaced, tokens } = extractSlackTokens(text);
+  const translated = restoreSlackTokens(
+    await translate(replaced, targetLang),
+    tokens
   );
 
   await postToSlack(
