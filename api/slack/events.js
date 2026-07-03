@@ -103,8 +103,12 @@ async function postToSlack(channel, threadTs, text) {
 }
 
 async function handleMessage(event) {
-  // Ignore bots (incl. ourselves), edits/joins/etc., and empty messages
-  if (event.bot_id || event.subtype || !event.text) return;
+  // Ignore bots (incl. ourselves) and empty messages.
+  // Subtypes are skipped (edits, joins, etc.) EXCEPT file_share —
+  // a message with an attached image/file arrives as subtype "file_share"
+  // and should still be translated if it has text.
+  if (event.bot_id || !event.text) return;
+  if (event.subtype && event.subtype !== "file_share") return;
 
   const text = event.text.trim();
   const stripped = text
