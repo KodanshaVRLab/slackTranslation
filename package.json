@@ -1,0 +1,12 @@
+{
+  "name": "slack-ja-en-translator-vercel",
+  "version": "2.0.0",
+  "description": "Auto-translates Slack messages JA↔EN, deployed on Vercel",
+  "type": "module",
+  "dependencies": {
+    "@vercel/functions": "^1.4.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
