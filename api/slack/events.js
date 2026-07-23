@@ -9,8 +9,45 @@ import { waitUntil } from "@vercel/functions";
 export const config = { api: { bodyParser: false } };
 
 const JAPANESE_REGEX = /[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF]/;
-const DEEPL_URL =
-  process.env.DEEPL_URL || "https://api-free.deepl.com/v2/translate";
+const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "claude-haiku-4-5-20251001";
+const CLAUDE_URL = "https://api.anthropic.com/v1/messages";
+
+const TRANSLATE_SYSTEM_PROMPT = `You are a translation engine embedded in a Slack bot for a Japanese/English game development team (Kodansha VR Lab). Translate the user's message between Japanese and English.
+
+Rules:
+- Output ONLY the translated text. No preamble, no explanation, no quotes around it.
+- Preserve placeholder tokens exactly as they appear, e.g. <x id="0"/> — never translate, remove, or reorder their content, but do place them naturally in the translated sentence.
+- Use natural, casual workplace tone — this is Slack chat, not a formal document. For Japanese output, prefer plain/casual form over formal keigo unless the source text is clearly formal.
+- Preserve technical terms, product names, and code identifiers (e.g. Unity, PICO, NGO, variable names) unchanged.
+- If the text is already entirely in the target language, or has no translatable content, output it unchanged.`;
+
+async function translate(text, targetLang) {
+  const targetName = targetLang === "JA" ? "Japanese" : "English";
+  const res = await fetch(CLAUDE_URL, {
+    method: "POST",
+    headers: {
+      "x-api-key": process.env.ANTHROPIC_API_KEY,
+      "anthropic-version": "2023-06-01",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: CLAUDE_MODEL,
+      max_tokens: 1024,
+      system: TRANSLATE_SYSTEM_PROMPT,
+      messages: [
+        {
+          role: "user",
+          content: `Translate the following into ${targetName}:\n\n${text}`,
+        },
+      ],
+    }),
+  });
+  if (!res.ok) throw new Error(`Claude ${res.status}: ${await res.text()}`);
+  const data = await res.json();
+  const textBlock = data.content.find((b) => b.type === "text");
+  if (!textBlock) throw new Error("Claude returned no text block");
+  return textBlock.text.trim();
+}
 
 function readRawBody(req) {
   return new Promise((resolve, reject) => {
@@ -66,27 +103,6 @@ function extractSlackTokens(text) {
 
 function restoreSlackTokens(text, tokens) {
   return text.replace(/<x id="(\d+)"\s*\/>/g, (_, i) => tokens[Number(i)] ?? "");
-}
-
-async function translate(text, targetLang) {
-  const res = await fetch(DEEPL_URL, {
-    method: "POST",
-    headers: {
-      Authorization: `DeepL-Auth-Key ${process.env.DEEPL_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      text: [text],
-      target_lang: targetLang, // "EN-US" or "JA"
-      tag_handling: "xml",
-      ignore_tags: ["x"],
-      // Casual register for Slack — remove this line if you want 敬語
-      formality: targetLang === "JA" ? "less" : "default",
-    }),
-  });
-  if (!res.ok) throw new Error(`DeepL ${res.status}: ${await res.text()}`);
-  const data = await res.json();
-  return data.translations[0].text;
 }
 
 async function postToSlack(channel, threadTs, text) {

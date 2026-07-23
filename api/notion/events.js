@@ -12,8 +12,16 @@ const NOTION = "https://api.notion.com/v1";
 const NOTION_VERSION = "2022-06-28";
 const JAPANESE_REGEX = /[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF]/;
 const FLAG_PREFIXES = ["🇬🇧", "🇯🇵"];
-const DEEPL_URL =
-  process.env.DEEPL_URL || "https://api-free.deepl.com/v2/translate";
+const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "claude-haiku-4-5-20251001";
+const CLAUDE_URL = "https://api.anthropic.com/v1/messages";
+
+const TRANSLATE_SYSTEM_PROMPT = `You are a translation engine embedded in a Notion workspace for a Japanese/English game development team (Kodansha VR Lab). Translate task discussion text between Japanese and English.
+
+Rules:
+- Output ONLY the translated text. No preamble, no explanation, no quotes around it.
+- Use natural, professional-but-casual workplace tone appropriate for internal task notes. For Japanese output, prefer plain/casual form over formal keigo unless the source is clearly formal.
+- Preserve technical terms, product names, and code identifiers (e.g. Unity, PICO, NGO, Timeline, variable names) unchanged.
+- If the text is already entirely in the target language, or has no translatable content, output it unchanged.`;
 
 // Block types whose rich_text we translate
 const TEXT_BLOCK_TYPES = new Set([
@@ -81,21 +89,31 @@ async function getBotId() {
 }
 
 async function translate(text, targetLang) {
-  const res = await fetch(DEEPL_URL, {
+  const targetName = targetLang === "JA" ? "Japanese" : "English";
+  const res = await fetch(CLAUDE_URL, {
     method: "POST",
     headers: {
-      Authorization: `DeepL-Auth-Key ${process.env.DEEPL_API_KEY}`,
+      "x-api-key": process.env.ANTHROPIC_API_KEY,
+      "anthropic-version": "2023-06-01",
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      text: [text],
-      target_lang: targetLang,
-      formality: targetLang === "JA" ? "less" : "default",
+      model: CLAUDE_MODEL,
+      max_tokens: 1024,
+      system: TRANSLATE_SYSTEM_PROMPT,
+      messages: [
+        {
+          role: "user",
+          content: `Translate the following into ${targetName}:\n\n${text}`,
+        },
+      ],
     }),
   });
-  if (!res.ok) throw new Error(`DeepL ${res.status}: ${await res.text()}`);
+  if (!res.ok) throw new Error(`Claude ${res.status}: ${await res.text()}`);
   const data = await res.json();
-  return data.translations[0].text;
+  const textBlock = data.content.find((b) => b.type === "text");
+  if (!textBlock) throw new Error("Claude returned no text block");
+  return textBlock.text.trim();
 }
 
 async function handleBlock(blockId, botId) {
