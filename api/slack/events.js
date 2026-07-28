@@ -135,7 +135,6 @@ async function handleMessage(event) {
 
   const isJapanese = JAPANESE_REGEX.test(stripped);
   const targetLang = isJapanese ? "EN-US" : "JA";
-  const flag = isJapanese ? "🇬🇧" : "🇯🇵";
 
   const { replaced, tokens } = extractSlackTokens(text);
   const translated = restoreSlackTokens(
@@ -146,7 +145,7 @@ async function handleMessage(event) {
   await postToSlack(
     event.channel,
     event.thread_ts || event.ts,
-    `${flag} ${translated}`
+    translated
   );
 }
 
