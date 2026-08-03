@@ -151,10 +151,13 @@ const MARKER = { "EN-US": "\u200B\u200C", JA: "\u200B\u200B" };
 // toggling on/off while testing, etc.) don't spam a new reply every time.
 async function alreadyTranslated(channel, threadTs, targetLang) {
   const marker = MARKER[targetLang];
+  // Slack caps `limit` at 15 for newer apps (was up to 1000) — requesting
+  // more than that returns invalid_arguments rather than clamping silently.
+  // 15 replies is plenty for detecting an existing translation in practice.
   const data = await slackApi("conversations.replies", {
     channel,
     ts: threadTs,
-    limit: 100,
+    limit: 15,
   });
   return (data.messages || []).some((m) => m.text?.includes(marker));
 }
