@@ -1,6 +1,11 @@
 // Vercel serverless endpoint: /api/slack/events
-// Slack JA↔EN auto-translation bot (HTTP Events API version)
-// JA messages → EN, EN messages → JA, posted as thread replies.
+// Slack on-demand translation bot (HTTP Events API version)
+//
+// Behavior: does NOT translate automatically. Translates only when someone
+// reacts to a message with one of two configured emoji:
+//   - REACTION_EN (default: "gb")  → posts an English translation
+//   - REACTION_JA (default: "jp")  → posts a Japanese translation
+// Translation is posted as a thread reply under the reacted-to message.
 
 import crypto from "crypto";
 import { waitUntil } from "@vercel/functions";
@@ -8,9 +13,14 @@ import { waitUntil } from "@vercel/functions";
 // We need the raw body for Slack signature verification
 export const config = { api: { bodyParser: false } };
 
-const JAPANESE_REGEX = /[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF]/;
 const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "claude-haiku-4-5-20251001";
 const CLAUDE_URL = "https://api.anthropic.com/v1/messages";
+
+// Emoji names (without colons) that trigger a translation.
+// Standard Slack shortcodes: :gb: (English flag), :jp: (Japan flag).
+// Override via env vars if the team prefers different emoji.
+const REACTION_EN = process.env.REACTION_EN || "gb";
+const REACTION_JA = process.env.REACTION_JA || "jp";
 
 const TRANSLATE_SYSTEM_PROMPT = `You are a translation engine embedded in a Slack bot for a Japanese/English game development team (Kodansha VR Lab). Translate the user's message between Japanese and English.
 
@@ -85,10 +95,9 @@ function verifySlackSignature(req, rawBody) {
   }
 }
 
-// Slack tokens like <@U123>, <#C123>, <https://…> are not valid XML,
-// so they can't be sent to DeepL as-is with tag_handling: "xml".
-// Instead, pull them out and replace with self-closing placeholder tags,
-// then restore them after translation.
+// Slack tokens like <@U123>, <#C123>, <https://…> aren't meant to be
+// translated. Extract them to placeholders before sending to Claude,
+// then restore afterward.
 function extractSlackTokens(text) {
   const tokens = [];
   const replaced = text.replace(
@@ -105,36 +114,60 @@ function restoreSlackTokens(text, tokens) {
   return text.replace(/<x id="(\d+)"\s*\/>/g, (_, i) => tokens[Number(i)] ?? "");
 }
 
-async function postToSlack(channel, threadTs, text) {
-  const res = await fetch("https://slack.com/api/chat.postMessage", {
+async function slackApi(method, body) {
+  const res = await fetch(`https://slack.com/api/${method}`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ channel, thread_ts: threadTs, text }),
+    body: JSON.stringify(body),
   });
   const data = await res.json();
-  if (!data.ok) throw new Error(`Slack API: ${data.error}`);
+  if (!data.ok) throw new Error(`Slack API ${method}: ${data.error}`);
+  return data;
 }
 
-async function handleMessage(event) {
-  // Ignore bots (incl. ourselves) and empty messages.
-  // Subtypes are skipped (edits, joins, etc.) EXCEPT file_share —
-  // a message with an attached image/file arrives as subtype "file_share"
-  // and should still be translated if it has text.
-  if (event.bot_id || !event.text) return;
-  if (event.subtype && event.subtype !== "file_share") return;
+// Fetch the exact message that was reacted to.
+async function getReactedMessage(channel, ts) {
+  const data = await slackApi("conversations.history", {
+    channel,
+    latest: ts,
+    inclusive: true,
+    limit: 1,
+  });
+  return data.messages?.[0] || null;
+}
 
-  const text = event.text.trim();
+async function postToSlack(channel, threadTs, text) {
+  await slackApi("chat.postMessage", {
+    channel,
+    thread_ts: threadTs,
+    text,
+  });
+}
+
+async function handleReaction(event) {
+  // Only care about reactions added to messages (not files, etc.)
+  if (event.item?.type !== "message") return;
+
+  const reaction = event.reaction;
+  let targetLang;
+  if (reaction === REACTION_EN) targetLang = "EN-US";
+  else if (reaction === REACTION_JA) targetLang = "JA";
+  else return; // not a translation-trigger emoji, ignore
+
+  const { channel, ts } = event.item;
+  const message = await getReactedMessage(channel, ts);
+  if (!message || !message.text) return;
+  if (message.bot_id) return; // don't translate other bot messages
+
+  const text = message.text.trim();
   const stripped = text
     .replace(/<[^>]+>/g, "")
     .replace(/:[a-z0-9_+-]+:/gi, "")
     .trim();
-  if (!stripped) return; // emoji/mention/link-only message
-
-  const isJapanese = JAPANESE_REGEX.test(stripped);
-  const targetLang = isJapanese ? "EN-US" : "JA";
+  if (!stripped) return; // emoji/mention/link-only message, nothing to translate
 
   const { replaced, tokens } = extractSlackTokens(text);
   const translated = restoreSlackTokens(
@@ -142,11 +175,7 @@ async function handleMessage(event) {
     tokens
   );
 
-  await postToSlack(
-    event.channel,
-    event.thread_ts || event.ts,
-    translated
-  );
+  await postToSlack(channel, message.thread_ts || ts, translated);
 }
 
 export default async function handler(req, res) {
@@ -171,11 +200,10 @@ export default async function handler(req, res) {
     return res.status(200).end();
   }
 
-  if (body.type === "event_callback" && body.event?.type === "message") {
+  if (body.type === "event_callback" && body.event?.type === "reaction_added") {
     // Ack Slack immediately (3s deadline), translate in the background.
-    // waitUntil keeps the function alive after the response is sent.
     waitUntil(
-      handleMessage(body.event).catch((err) =>
+      handleReaction(body.event).catch((err) =>
         console.error("translation failed:", err)
       )
     );
