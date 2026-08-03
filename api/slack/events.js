@@ -3,8 +3,8 @@
 //
 // Behavior: does NOT translate automatically. Translates only when someone
 // reacts to a message with one of two configured emoji:
-//   - REACTION_EN (default: "gb")  → posts an English translation
-//   - REACTION_JA (default: "jp")  → posts a Japanese translation
+//   - REACTION_EN (default: "english")  → posts an English translation
+//   - REACTION_JA (default: "japanese") → posts a Japanese translation
 // Translation is posted as a thread reply under the reacted-to message.
 
 import crypto from "crypto";
@@ -17,10 +17,12 @@ const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "claude-haiku-4-5-20251001";
 const CLAUDE_URL = "https://api.anthropic.com/v1/messages";
 
 // Emoji names (without colons) that trigger a translation.
-// Standard Slack shortcodes: :gb: (English flag), :jp: (Japan flag).
-// Override via env vars if the team prefers different emoji.
-const REACTION_EN = process.env.REACTION_EN || "gb";
-const REACTION_JA = process.env.REACTION_JA || "jp";
+// Defaults to custom workspace emoji :english: and :japanese: — these are
+// NOT standard Slack emoji, so someone needs to upload them as custom emoji
+// (Slack admin → Customize → Emoji) with exactly these names, or override
+// via env vars to use standard emoji instead (e.g. "gb" / "jp").
+const REACTION_EN = process.env.REACTION_EN || "english";
+const REACTION_JA = process.env.REACTION_JA || "japanese";
 
 const TRANSLATE_SYSTEM_PROMPT = `You are a translation engine embedded in a Slack bot for a Japanese/English game development team (Kodansha VR Lab). Translate the user's message between Japanese and English.
 
@@ -139,11 +141,29 @@ async function getReactedMessage(channel, ts) {
   return data.messages?.[0] || null;
 }
 
-async function postToSlack(channel, threadTs, text) {
+// Invisible per-language markers appended to posted translations, used only
+// to detect "have we already translated this message into this language"
+// on a later, redundant reaction — not visible to users in Slack's UI.
+const MARKER = { "EN-US": "\u200B\u200C", JA: "\u200B\u200B" };
+
+// Check the thread for a translation we already posted in this target
+// language, so repeated/duplicate reactions (same or different users,
+// toggling on/off while testing, etc.) don't spam a new reply every time.
+async function alreadyTranslated(channel, threadTs, targetLang) {
+  const marker = MARKER[targetLang];
+  const data = await slackApi("conversations.replies", {
+    channel,
+    ts: threadTs,
+    limit: 100,
+  });
+  return (data.messages || []).some((m) => m.text?.includes(marker));
+}
+
+async function postToSlack(channel, threadTs, text, targetLang) {
   await slackApi("chat.postMessage", {
     channel,
     thread_ts: threadTs,
-    text,
+    text: text + MARKER[targetLang],
   });
 }
 
@@ -162,6 +182,9 @@ async function handleReaction(event) {
   if (!message || !message.text) return;
   if (message.bot_id) return; // don't translate other bot messages
 
+  const threadTs = message.thread_ts || ts;
+  if (await alreadyTranslated(channel, threadTs, targetLang)) return;
+
   const text = message.text.trim();
   const stripped = text
     .replace(/<[^>]+>/g, "")
@@ -175,7 +198,7 @@ async function handleReaction(event) {
     tokens
   );
 
-  await postToSlack(channel, message.thread_ts || ts, translated);
+  await postToSlack(channel, threadTs, translated, targetLang);
 }
 
 export default async function handler(req, res) {
