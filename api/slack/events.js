@@ -149,17 +149,24 @@ const MARKER = { "EN-US": "\u200B\u200C", JA: "\u200B\u200B" };
 // Check the thread for a translation we already posted in this target
 // language, so repeated/duplicate reactions (same or different users,
 // toggling on/off while testing, etc.) don't spam a new reply every time.
+//
+// This is a best-effort convenience check, not a critical path: if it fails
+// for any reason (API quirk, scope issue, rate limit), we fail OPEN — treat
+// it as "not yet translated" and proceed, rather than blocking the actual
+// translation a user is waiting on. A rare duplicate reply is a much smaller
+// problem than the bot silently doing nothing.
 async function alreadyTranslated(channel, threadTs, targetLang) {
-  const marker = MARKER[targetLang];
-  // Slack caps `limit` at 15 for newer apps (was up to 1000) — requesting
-  // more than that returns invalid_arguments rather than clamping silently.
-  // 15 replies is plenty for detecting an existing translation in practice.
-  const data = await slackApi("conversations.replies", {
-    channel,
-    ts: threadTs,
-    limit: 15,
-  });
-  return (data.messages || []).some((m) => m.text?.includes(marker));
+  try {
+    const marker = MARKER[targetLang];
+    const data = await slackApi("conversations.replies", {
+      channel,
+      ts: threadTs,
+    });
+    return (data.messages || []).some((m) => m.text?.includes(marker));
+  } catch (err) {
+    console.error("dedup check failed, proceeding without it:", err.message);
+    return false;
+  }
 }
 
 async function postToSlack(channel, threadTs, text, targetLang) {
