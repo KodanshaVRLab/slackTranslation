@@ -130,21 +130,34 @@ async function slackApi(method, body) {
   return data;
 }
 
+// Read methods (conversations.replies in particular) reject JSON POST
+// bodies with invalid_arguments — JSON bodies are only officially supported
+// for write methods. Read methods must be called as GET with query params.
+async function slackApiGet(method, params) {
+  const query = new URLSearchParams(params).toString();
+  const res = await fetch(`https://slack.com/api/${method}?${query}`, {
+    method: "GET",
+    headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
+  });
+  const data = await res.json();
+  if (!data.ok) throw new Error(`Slack API ${method}: ${data.error}`);
+  return data;
+}
+
 // Fetch the exact message that was reacted to.
+// Uses conversations.replies (not conversations.history) because history
+// only returns channel-level messages — never thread replies — so reacting
+// to a reply would fetch (and translate) the wrong message, usually the
+// thread parent. conversations.replies with a reply's own ts returns that
+// exact message; with a parent's ts it returns the parent first. Works for both.
 async function getReactedMessage(channel, ts) {
-  const data = await slackApi("conversations.history", {
+  const data = await slackApiGet("conversations.replies", {
     channel,
-    latest: ts,
-    inclusive: true,
+    ts,
     limit: 1,
   });
   return data.messages?.[0] || null;
 }
-
-// Invisible per-language markers appended to posted translations, used only
-// to detect "have we already translated this message into this language"
-// on a later, redundant reaction — not visible to users in Slack's UI.
-const MARKER = { "EN-US": "\u200B\u200C", JA: "\u200B\u200B" };
 
 // Check the thread for a translation we already posted in this target
 // language, so repeated/duplicate reactions (same or different users,
@@ -155,25 +168,45 @@ const MARKER = { "EN-US": "\u200B\u200C", JA: "\u200B\u200B" };
 // it as "not yet translated" and proceed, rather than blocking the actual
 // translation a user is waiting on. A rare duplicate reply is a much smaller
 // problem than the bot silently doing nothing.
-async function alreadyTranslated(channel, threadTs, targetLang) {
+// Dedup uses Slack message metadata: every translation we post carries
+// { event_type: "translation_posted", event_payload: { source_ts, lang } }.
+// Metadata is invisible to users but returned to apps, and lets us scope
+// dedup to the exact source message — not the whole thread — so translating
+// one reply doesn't block translating a different reply in the same thread.
+//
+// Best-effort check, not critical path: on any error we fail OPEN — treat as
+// "not yet translated" and proceed. A rare duplicate reply is a much smaller
+// problem than the bot silently doing nothing.
+async function alreadyTranslated(channel, threadTs, sourceTs, targetLang) {
   try {
-    const marker = MARKER[targetLang];
-    const data = await slackApi("conversations.replies", {
+    const data = await slackApiGet("conversations.replies", {
       channel,
       ts: threadTs,
+      include_all_metadata: true,
     });
-    return (data.messages || []).some((m) => m.text?.includes(marker));
+    return (data.messages || []).some((m) => {
+      const meta = m.metadata;
+      return (
+        meta?.event_type === "translation_posted" &&
+        meta.event_payload?.source_ts === sourceTs &&
+        meta.event_payload?.lang === targetLang
+      );
+    });
   } catch (err) {
     console.error("dedup check failed, proceeding without it:", err.message);
     return false;
   }
 }
 
-async function postToSlack(channel, threadTs, text, targetLang) {
+async function postToSlack(channel, threadTs, text, sourceTs, targetLang) {
   await slackApi("chat.postMessage", {
     channel,
     thread_ts: threadTs,
-    text: text + MARKER[targetLang],
+    text,
+    metadata: {
+      event_type: "translation_posted",
+      event_payload: { source_ts: sourceTs, lang: targetLang },
+    },
   });
 }
 
@@ -193,7 +226,7 @@ async function handleReaction(event) {
   if (message.bot_id) return; // don't translate other bot messages
 
   const threadTs = message.thread_ts || ts;
-  if (await alreadyTranslated(channel, threadTs, targetLang)) return;
+  if (await alreadyTranslated(channel, threadTs, ts, targetLang)) return;
 
   const text = message.text.trim();
   const stripped = text
@@ -208,7 +241,7 @@ async function handleReaction(event) {
     tokens
   );
 
-  await postToSlack(channel, threadTs, translated, targetLang);
+  await postToSlack(channel, threadTs, translated, ts, targetLang);
 }
 
 export default async function handler(req, res) {
