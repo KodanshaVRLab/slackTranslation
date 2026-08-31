@@ -44,7 +44,11 @@ async function translate(text, targetLang) {
     },
     body: JSON.stringify({
       model: CLAUDE_MODEL,
-      max_tokens: 1024,
+      // Output cap. Japanese is token-dense (~1-2 tokens per character), so
+      // long messages need far more than the old 1024 cap or they get cut
+      // off mid-sentence. Only generated tokens are billed, so a high cap
+      // costs nothing on short messages.
+      max_tokens: 8192,
       system: TRANSLATE_SYSTEM_PROMPT,
       messages: [
         {
@@ -58,7 +62,14 @@ async function translate(text, targetLang) {
   const data = await res.json();
   const textBlock = data.content.find((b) => b.type === "text");
   if (!textBlock) throw new Error("Claude returned no text block");
-  return textBlock.text.trim();
+  let out = textBlock.text.trim();
+  // If we still hit the cap, say so instead of silently posting half a
+  // translation — a visible marker is far better than a misleading one.
+  if (data.stop_reason === "max_tokens") {
+    console.warn("translation truncated at max_tokens; input length:", text.length);
+    out += "\n\n_(翻訳が長すぎるため途中で切れています / translation truncated — message too long)_";
+  }
+  return out;
 }
 
 function readRawBody(req) {
