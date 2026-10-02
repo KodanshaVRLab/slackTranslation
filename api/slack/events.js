@@ -24,6 +24,16 @@ const CLAUDE_URL = "https://api.anthropic.com/v1/messages";
 const REACTION_EN = process.env.REACTION_EN || "english";
 const REACTION_JA = process.env.REACTION_JA || "japanese";
 
+// Bot messages are normally skipped (this bot's own translations, other bots'
+// noise). Bots listed here (comma-separated bot_id values, e.g. "B0C64LM144E"
+// for the minutes-to-tasks bot) are translated like people's messages.
+const TRANSLATE_BOT_IDS = new Set(
+  (process.env.TRANSLATE_BOT_IDS || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+);
+
 const TRANSLATE_SYSTEM_PROMPT = `You are a translation engine embedded in a Slack bot for a Japanese/English game development team (Kodansha VR Lab). Translate the user's message between Japanese and English.
 
 Rules:
@@ -234,7 +244,9 @@ async function handleReaction(event) {
   const { channel, ts } = event.item;
   const message = await getReactedMessage(channel, ts);
   if (!message || !message.text) return;
-  if (message.bot_id) return; // don't translate other bot messages
+  // Don't translate bot messages, except bots on the TRANSLATE_BOT_IDS allowlist.
+  // This bot's own translations are never on the list, so it can't loop.
+  if (message.bot_id && !TRANSLATE_BOT_IDS.has(message.bot_id)) return;
 
   const threadTs = message.thread_ts || ts;
   if (await alreadyTranslated(channel, threadTs, ts, targetLang)) return;
