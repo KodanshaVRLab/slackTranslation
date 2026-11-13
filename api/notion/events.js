@@ -8,8 +8,11 @@
 // IN THE PAGE BODY (page.content_updated) — e.g. under a "new Timestamp" entry:
 //   • A text block ending with a flag ("Ami is not moving 🇯🇵"), or
 //   • a block that is only a flag, right under the text block to translate
-//   → that block is replaced by a tab block 🇬🇧 English | 🇯🇵 日本語 holding
-//     the original and the translation; the flag is removed.
+//   → the whole entry (every text block from the heading above — normally the
+//     "new Timestamp" heading — down to the flag) is replaced by a tab block
+//     🇬🇧 English | 🇯🇵 日本語 holding the original and the translation,
+//     translated in one call; the flag is removed. Nested blocks are kept
+//     but flattened.
 //   • Inside those tabs, edit one side and end a line with a flag → the
 //     other tab is re-translated from the side you edited.
 //
@@ -66,6 +69,7 @@ const COMMENT_SYSTEM_PROMPT = `You are a translation engine embedded in a Notion
 Rules:
 - Output ONLY the translated text. No preamble, no explanation, no quotes around it.
 - Preserve placeholder tokens exactly as they appear, e.g. <x id="0"/> — never translate, remove, or reorder their content, but do place them naturally in the translated sentence.
+- Text may be split into blocks, each starting with a marker line like <b id="0"/>. Keep every marker exactly, in the same order, each on its own line, and put the translation of that block after it. Never merge or split blocks.
 - Use natural, professional-but-casual workplace tone. For Japanese output, prefer plain/casual form over formal keigo unless the source is clearly formal.
 - Preserve technical terms, product names, and code identifiers (e.g. Unity, PICO, NGO, Timeline, variable names) unchanged.
 - If the text is already entirely in the target language, or has no translatable content, output it unchanged.`;
@@ -217,8 +221,7 @@ const textRT = (content) => ({ type: "text", text: { content } });
 
 // Mentions, equations and links must survive translation untouched: swap them
 // for <x id="n"/> placeholders, translate, then put the originals back.
-function richTextToTagged(richText) {
-  const tokens = [];
+function richTextToTagged(richText, tokens = []) {
   const text = richText
     .map((rt) => {
       if (rt.type === "text" && !rt.text.link) return rt.text.content;
@@ -510,6 +513,49 @@ async function translateRich(richText, lang) {
   return taggedToRichText(out, tokens);
 }
 
+// Translate several blocks in ONE call (so the model sees the whole entry),
+// returning request-shaped rich text per block. Blocks without words are
+// copied as they are. Falls back to one call per block if the markers
+// don't come back intact.
+async function translateRichList(list, lang) {
+  const out = list.map((rich) => rich.map(toRequestRT));
+  const idx = list.map((rich, i) => i).filter((i) => HAS_WORDS.test(plainText(list[i])));
+  if (!idx.length) return out;
+
+  const tokens = [];
+  const source = idx
+    .map((i, n) => `<b id="${n}"/>\n${richTextToTagged(list[i], tokens).text}`)
+    .join("\n\n");
+  const result = await translate(source, lang, COMMENT_SYSTEM_PROMPT, 16000);
+  const parts = result.text.split(/<b id="(\d+)"\s*\/>/);
+  const got = {};
+  for (let p = 1; p < parts.length; p += 2) got[Number(parts[p])] = parts[p + 1].trim();
+
+  if (!result.truncated && idx.every((_, n) => n in got)) {
+    idx.forEach((i, n) => (out[i] = taggedToRichText(got[n], tokens)));
+  } else {
+    console.warn("block markers lost, translating block by block");
+    for (const i of idx) out[i] = await translateRich(list[i], lang);
+  }
+  return out;
+}
+
+// Blocks in document order, nested children flattened right after their
+// parent (a tab item can't take the deeper nesting in one request, and
+// flattening keeps the text instead of dropping it).
+async function flattenBlocks(blocks) {
+  const flat = [];
+  for (const b of blocks) {
+    if (!CONTENT_TYPES.has(b.type)) continue;
+    flat.push(b);
+    if (b.has_children) flat.push(...(await flattenBlocks(await listChildren(b.id))));
+  }
+  return flat;
+}
+
+const isBoundary = (b) =>
+  !CONTENT_TYPES.has(b.type) || b.type.startsWith("heading_");
+
 function itemLang(item) {
   if (item.type !== "paragraph") return null;
   const emoji = item.paragraph.icon?.emoji;
@@ -539,16 +585,9 @@ async function findTabContext(block) {
 // Re-translate the other tab from the whole tab the person edited
 async function refreshTab(ctx) {
   const to = ctx.from === "JA" ? "EN" : "JA";
-  const sourceBlocks = (await listChildren(ctx.items[ctx.from].id)).filter(
-    (b) => CONTENT_TYPES.has(b.type)
-  );
-  const translated = [];
-  for (const b of sourceBlocks) {
-    const rich = b[b.type].rich_text || [];
-    translated.push(
-      contentBlock(b, HAS_WORDS.test(plainText(rich)) ? await translateRich(rich, to) : rich.map(toRequestRT))
-    );
-  }
+  const sourceBlocks = await flattenBlocks(await listChildren(ctx.items[ctx.from].id));
+  const rich = await translateRichList(sourceBlocks.map((b) => b[b.type].rich_text || []), to);
+  const translated = sourceBlocks.map((b, i) => contentBlock(b, rich[i]));
   for (const old of await listChildren(ctx.items[to].id)) await deleteBlock(old.id);
   if (translated.length) {
     await notionFetch(`/blocks/${ctx.items[to].id}/children`, {
@@ -567,19 +606,21 @@ async function handleBlock(blockId, botId) {
   const trig = trailingFlag(plainText(rich));
   if (!trig) return;
 
-  // Which block is being translated: this one, or the one above a lone flag
+  // The flag sits on the last block of the entry, or alone right under it
+  const siblings = await listChildren(parentIdOf(block));
+  const at = siblings.findIndex((b) => b.id === block.id);
   let source = block;
   let sourceRich = stripTrailingFlag(rich, trig.flag);
   let flagBlock = null;
+  let end = at;
   if (trig.only) {
-    const siblings = await listChildren(parentIdOf(block));
-    const prev = siblings[siblings.findIndex((b) => b.id === block.id) - 1];
+    end = at - 1;
+    const prev = siblings[end];
     if (!prev || !CONTENT_TYPES.has(prev.type)) return;
     source = prev;
     sourceRich = prev[prev.type].rich_text || [];
     flagBlock = block;
   }
-  if (!HAS_WORDS.test(plainText(sourceRich))) return;
 
   // Remove the flag the person typed (it was the "reaction")
   if (flagBlock) await deleteBlock(flagBlock.id);
@@ -593,22 +634,42 @@ async function handleBlock(blockId, botId) {
   const ctx = await findTabContext(source);
   if (ctx) return refreshTab(ctx);
 
-  const srcLang = detectLang(plainText(sourceRich));
+  // The whole entry: walk up from the flagged block to the previous heading
+  // (the "new Timestamp" heading), tab block, or any non-text block.
+  if (source.type.startsWith("heading_")) return; // a flag right under the timestamp
+  let start = end;
+  while (start > 0 && !isBoundary(siblings[start - 1])) start--;
+  const range = siblings.slice(start, end + 1);
+  range[range.length - 1] = { ...source, [source.type]: { ...source[source.type], rich_text: sourceRich } };
+  // Trim empty lines at the start of the entry
+  while (range.length > 1 && !plainText(range[0][range[0].type].rich_text).trim() && !range[0].has_children) {
+    range.shift();
+  }
+
+  const blocks = await flattenBlocks(range);
+  const sourceRichList = blocks.map((b) => b[b.type].rich_text || []);
+  const allText = sourceRichList.map(plainText).join("\n");
+  if (!HAS_WORDS.test(allText)) return;
+
+  const srcLang = detectLang(allText);
   const dstLang = srcLang === "JA" ? "EN" : "JA";
+  const translatedRich = await translateRichList(sourceRichList, dstLang);
   const content = {
-    [srcLang]: [contentBlock(source, sourceRich.map(toRequestRT))],
-    [dstLang]: [contentBlock(source, await translateRich(sourceRich, dstLang))],
+    [srcLang]: blocks.map((b, i) => contentBlock(b, sourceRichList[i].map(toRequestRT))),
+    [dstLang]: blocks.map((b, i) => contentBlock(b, translatedRich[i])),
   };
   await notionFetch(`/blocks/${parentIdOf(source)}/children`, {
     method: "PATCH",
     body: JSON.stringify({
       position: { type: "after_block", after_block: { id: source.id } },
-      children: [{ type: "tab", tab: { children: [tabItem("EN", content.EN), tabItem("JA", content.JA)] } }],
+      children: [{
+        type: "tab",
+        tab: { children: [tabItem("EN", content.EN.slice(0, 100)), tabItem("JA", content.JA.slice(0, 100))] },
+      }],
     }),
   });
-  // The original now lives in its tab. Keep it only if it has nested blocks
-  // we would otherwise lose.
-  if (!source.has_children) await deleteBlock(source.id);
+  // The originals now live in their tab (children included, flattened)
+  for (const b of range) await deleteBlock(b.id);
 }
 
 async function handlePageEvent(body) {
