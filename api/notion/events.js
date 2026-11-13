@@ -2,12 +2,20 @@
 // Notion JA↔EN on-demand translation (works like the Slack bot: nothing is
 // translated automatically, a person asks for it).
 //
-// Notion's API has no reaction events, so the trigger is a comment whose
-// whole text is a flag (or keyword):
-//   🇯🇵 / ja / jp / japanese / 日本語  → Japanese
-//   🇬🇧 / 🇺🇸 / en / english / 英語     → English
+// Notion's API has no reaction events, so the "reaction" is a flag emoji
+// typed by a person: 🇯🇵 = Japanese, 🇬🇧 / 🇺🇸 = English.
 //
-// Where the trigger comment is posted decides what gets translated:
+// IN THE PAGE BODY (page.content_updated) — e.g. under a "new Timestamp" entry:
+//   • A text block ending with a flag ("Ami is not moving 🇯🇵"), or
+//   • a block that is only a flag, right under the text block to translate
+//   → that block is replaced by a tab block 🇬🇧 English | 🇯🇵 日本語 holding
+//     the original and the translation; the flag is removed.
+//   • Inside those tabs, edit one side and end a line with a flag → the
+//     other tab is re-translated from the side you edited.
+//
+// IN COMMENTS (comment.created) — the comment text can also be a keyword
+// (ja / jp / japanese / 日本語, en / english / 英語):
+//   • "some text 🇯🇵" → the bot replies with that comment translated.
 //
 //   • New page comment (first comment of a discussion) → the PAGE.
 //     The page body is wrapped in a bilingual tab block at the top:
@@ -23,8 +31,8 @@
 //     is posted as a reply prefixed with the flag.
 //
 // Notion setup: integration capabilities Read content, Update content,
-// Read comments, Insert comments; webhook subscription with `comment.created`
-// (page.content_updated is no longer used and can be unsubscribed).
+// Insert content, Read comments, Insert comments; webhook subscription with
+// `page.content_updated` and `comment.created`.
 
 import crypto from "crypto";
 import { waitUntil } from "@vercel/functions";
@@ -420,7 +428,202 @@ async function translatePage(pageId, lang) {
   return lang;
 }
 
-// ─── event handling ──────────────────────────────────────────────────────────
+// ─── page-body blocks ────────────────────────────────────────────────────────
+
+const BLOCK_FLAGS = [["🇯🇵", "JA"], ["🇬🇧", "EN"], ["🇺🇸", "EN"]];
+const CONTENT_TYPES = new Set([
+  "paragraph", "bulleted_list_item", "numbered_list_item", "to_do",
+  "quote", "callout", "heading_1", "heading_2", "heading_3",
+]);
+const HAS_WORDS = /[a-zA-Z぀-ゟ゠-ヿ一-鿿]/;
+
+function trailingFlag(text) {
+  const t = text.trimEnd();
+  for (const [flag, lang] of BLOCK_FLAGS) {
+    if (t.endsWith(flag)) return { flag, lang, only: t.slice(0, -flag.length).trim() === "" };
+  }
+  return null;
+}
+
+// Copy of richText without the trailing flag (and trailing whitespace)
+function stripTrailingFlag(richText, flag) {
+  const rt = richText.map((r) => structuredClone(r));
+  for (let i = rt.length - 1; i >= 0; i--) {
+    const r = rt[i];
+    if (r.type !== "text") break;
+    const c = r.text.content.trimEnd();
+    if (c.endsWith(flag)) r.text.content = c.slice(0, -flag.length).trimEnd();
+    else r.text.content = c;
+    r.plain_text = r.text.content;
+    if (r.text.content) break;
+    rt.splice(i, 1); // nothing left in this run, keep looking left
+    if (c.endsWith(flag)) break;
+  }
+  return rt;
+}
+
+const parentIdOf = (b) =>
+  b.parent.type === "page_id" ? b.parent.page_id
+  : b.parent.type === "block_id" ? b.parent.block_id
+  : null;
+
+async function listChildren(blockId) {
+  const all = [];
+  let cursor;
+  do {
+    const q = new URLSearchParams({ page_size: "100" });
+    if (cursor) q.set("start_cursor", cursor);
+    const data = await notionFetch(`/blocks/${blockId}/children?${q}`);
+    all.push(...data.results);
+    cursor = data.has_more ? data.next_cursor : null;
+  } while (cursor);
+  return all;
+}
+
+const deleteBlock = (id) => notionFetch(`/blocks/${id}`, { method: "DELETE" });
+
+// A request-shaped block of the same kind as src, with new rich text
+function contentBlock(src, richText) {
+  const type = CONTENT_TYPES.has(src.type) ? src.type : "paragraph";
+  const body = { rich_text: richText, color: src[src.type]?.color || "default" };
+  if (type === "to_do") body.checked = !!src.to_do.checked;
+  if (type === "callout" && src.callout.icon?.type === "emoji") body.icon = src.callout.icon;
+  return { type, [type]: body };
+}
+
+function tabItem(lang, children) {
+  return {
+    type: "paragraph",
+    paragraph: {
+      rich_text: [textRT(LABEL[lang])],
+      icon: { type: "emoji", emoji: FLAG[lang] },
+      children,
+    },
+  };
+}
+
+async function translateRich(richText, lang) {
+  const { text, tokens } = richTextToTagged(richText);
+  const result = await translate(text, lang, COMMENT_SYSTEM_PROMPT, 8192);
+  let out = result.text;
+  if (result.truncated) out += " (translation truncated / 翻訳が途中で切れています)";
+  return taggedToRichText(out, tokens);
+}
+
+function itemLang(item) {
+  if (item.type !== "paragraph") return null;
+  const emoji = item.paragraph.icon?.emoji;
+  const label = plainText(item.paragraph.rich_text).trim();
+  if (emoji === FLAG.EN || /^english$/i.test(label)) return "EN";
+  if (emoji === FLAG.JA || label === LABEL.JA) return "JA";
+  return null;
+}
+
+// If block sits directly inside one of our EN/JA tabs, return that context
+async function findTabContext(block) {
+  if (block.parent.type !== "block_id") return null;
+  const item = await notionFetch(`/blocks/${block.parent.block_id}`);
+  if (item.type !== "paragraph" || item.parent.type !== "block_id") return null;
+  const tab = await notionFetch(`/blocks/${item.parent.block_id}`);
+  if (tab.type !== "tab") return null;
+  const items = {};
+  for (const it of await listChildren(tab.id)) {
+    const lang = itemLang(it);
+    if (lang) items[lang] = it;
+  }
+  const from = itemLang(item);
+  if (!items.EN || !items.JA || !from) return null;
+  return { items, from };
+}
+
+// Re-translate the other tab from the whole tab the person edited
+async function refreshTab(ctx) {
+  const to = ctx.from === "JA" ? "EN" : "JA";
+  const sourceBlocks = (await listChildren(ctx.items[ctx.from].id)).filter(
+    (b) => CONTENT_TYPES.has(b.type)
+  );
+  const translated = [];
+  for (const b of sourceBlocks) {
+    const rich = b[b.type].rich_text || [];
+    translated.push(
+      contentBlock(b, HAS_WORDS.test(plainText(rich)) ? await translateRich(rich, to) : rich.map(toRequestRT))
+    );
+  }
+  for (const old of await listChildren(ctx.items[to].id)) await deleteBlock(old.id);
+  if (translated.length) {
+    await notionFetch(`/blocks/${ctx.items[to].id}/children`, {
+      method: "PATCH",
+      body: JSON.stringify({ children: translated.slice(0, 100) }),
+    });
+  }
+}
+
+async function handleBlock(blockId, botId) {
+  const block = await notionFetch(`/blocks/${blockId}`);
+  if (!CONTENT_TYPES.has(block.type) || block.in_trash) return;
+  if (block.last_edited_by?.id === botId) return; // our own edit → no loop
+
+  const rich = block[block.type].rich_text || [];
+  const trig = trailingFlag(plainText(rich));
+  if (!trig) return;
+
+  // Which block is being translated: this one, or the one above a lone flag
+  let source = block;
+  let sourceRich = stripTrailingFlag(rich, trig.flag);
+  let flagBlock = null;
+  if (trig.only) {
+    const siblings = await listChildren(parentIdOf(block));
+    const prev = siblings[siblings.findIndex((b) => b.id === block.id) - 1];
+    if (!prev || !CONTENT_TYPES.has(prev.type)) return;
+    source = prev;
+    sourceRich = prev[prev.type].rich_text || [];
+    flagBlock = block;
+  }
+  if (!HAS_WORDS.test(plainText(sourceRich))) return;
+
+  // Remove the flag the person typed (it was the "reaction")
+  if (flagBlock) await deleteBlock(flagBlock.id);
+  else {
+    await notionFetch(`/blocks/${block.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ [block.type]: { rich_text: sourceRich.map(toRequestRT) } }),
+    });
+  }
+
+  const ctx = await findTabContext(source);
+  if (ctx) return refreshTab(ctx);
+
+  const srcLang = detectLang(plainText(sourceRich));
+  const dstLang = srcLang === "JA" ? "EN" : "JA";
+  const content = {
+    [srcLang]: [contentBlock(source, sourceRich.map(toRequestRT))],
+    [dstLang]: [contentBlock(source, await translateRich(sourceRich, dstLang))],
+  };
+  await notionFetch(`/blocks/${parentIdOf(source)}/children`, {
+    method: "PATCH",
+    body: JSON.stringify({
+      position: { type: "after_block", after_block: { id: source.id } },
+      children: [{ type: "tab", tab: { children: [tabItem("EN", content.EN), tabItem("JA", content.JA)] } }],
+    }),
+  });
+  // The original now lives in its tab. Keep it only if it has nested blocks
+  // we would otherwise lose.
+  if (!source.has_children) await deleteBlock(source.id);
+}
+
+async function handlePageEvent(body) {
+  const botId = await getBotId();
+  if (body.authors?.length && body.authors.every((a) => a.id === botId)) return;
+  for (const { id } of body.data?.updated_blocks || []) {
+    try {
+      await handleBlock(id, botId);
+    } catch (err) {
+      console.error(`block ${id} failed:`, err.message);
+    }
+  }
+}
+
+// ─── comment events ──────────────────────────────────────────────────────────
 
 async function handleComment(body) {
   const botId = await getBotId();
@@ -428,8 +631,22 @@ async function handleComment(body) {
 
   const comment = await notionFetch(`/comments/${body.entity.id}`);
   if (comment.created_by?.id === botId) return;
-  const lang = parseTrigger(plainText(comment.rich_text));
-  if (!lang) return;
+  const text = plainText(comment.rich_text);
+  const lang = parseTrigger(text);
+
+  if (!lang) {
+    // "some text 🇯🇵" → translate this comment itself
+    const trig = trailingFlag(text);
+    if (!trig || trig.only) return;
+    const stripped = stripTrailingFlag(comment.rich_text, trig.flag);
+    if (!HAS_WORDS.test(plainText(stripped))) return;
+    try {
+      await translateComment([{ ...comment, rich_text: stripped }, comment], 1, trig.lang, botId);
+    } catch (err) {
+      console.error("comment translation failed:", err);
+    }
+    return;
+  }
 
   try {
     const parentId = comment.parent.page_id || comment.parent.block_id;
@@ -473,10 +690,15 @@ export default async function handler(req, res) {
     return res.status(401).json({ error: "invalid signature" });
   }
 
-  // Only comments trigger work now; page edits are no longer auto-translated.
+  console.log("notion event:", body.type, body.entity?.id);
+  // Nothing is auto-translated: both handlers only act on a flag a person typed.
   if (body.type === "comment.created") {
     waitUntil(
       handleComment(body).catch((err) => console.error("notion failed:", err))
+    );
+  } else if (body.type === "page.content_updated") {
+    waitUntil(
+      handlePageEvent(body).catch((err) => console.error("notion failed:", err))
     );
   }
 
