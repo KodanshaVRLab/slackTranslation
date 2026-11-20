@@ -63,6 +63,8 @@ const CLAUDE_URL = "https://api.anthropic.com/v1/messages";
 
 const FLAG = { EN: "🇬🇧", JA: "🇯🇵" };
 const LABEL = { EN: "English", JA: "日本語" };
+const LABEL_EN = { EN: "English", JA: "Japanese" };
+const LABEL_JA = { EN: "英語", JA: "日本語" };
 
 function triggerList(envValue, defaults) {
   const list = envValue
@@ -230,13 +232,27 @@ async function listDiscussion(parentId, discussionId) {
     .sort((a, b) => a.created_time.localeCompare(b.created_time));
 }
 
-// A page-level comment: the bot's only way to tell people what it did
-async function pageNote(pageId, text) {
+// A comment telling people what the bot did — the only way it can talk.
+// userId → @-mentions that person (they get a Notion notification).
+// blockId → anchored next to that block when the API allows it.
+// Falls back to page level, then to no mention; never throws.
+async function pageNote(pageId, text, { userId, blockId } = {}) {
   if (!pageId) return;
-  await notionFetch("/comments", {
-    method: "POST",
-    body: JSON.stringify({ parent: { page_id: pageId }, rich_text: [textRT(text)] }),
-  }).catch((err) => console.warn("page note failed:", err.message));
+  const withMention = userId
+    ? [{ type: "mention", mention: { user: { id: userId } } }, textRT(` ${text}`)]
+    : null;
+  const parents = [...(blockId ? [{ block_id: blockId }] : []), { page_id: pageId }];
+  const bodies = [withMention, [textRT(text)]].filter(Boolean);
+  for (const rich_text of bodies) {
+    for (const parent of parents) {
+      try {
+        await notionFetch("/comments", { method: "POST", body: JSON.stringify({ parent, rich_text }) });
+        return;
+      } catch (err) {
+        console.warn(`comment on ${JSON.stringify(parent)} failed:`, err.message);
+      }
+    }
+  }
 }
 
 async function reply(discussionId, richText) {
@@ -933,10 +949,12 @@ async function readTab(tabId, order = new Map()) {
 // "↩️ undo" — undo the newest translation: the original text is rebuilt
 // from the tab's source side, in the tab's place, and the tab is removed.
 // Either way the bot leaves a page comment saying what happened.
-async function restore(pageId, trigger, undo) {
+async function restore(pageId, trigger, undo, botId) {
   await deleteBlock(trigger.id);
+  const by = trigger.last_edited_by?.id;
+  const say = (text) => pageNote(pageId, text, { userId: by !== botId ? by : undefined });
   if (!LOG_DB) {
-    await pageNote(pageId, "↩️ Restore is not set up (NOTION_LOG_DATABASE_ID). / 復元機能が設定されていません。");
+    await say("↩️ Restore is not set up (NOTION_LOG_DATABASE_ID). / 復元機能が設定されていません。");
     return;
   }
   const rows = (await notionFetch(`/data_sources/${await logSourceId()}/query`, {
@@ -965,11 +983,11 @@ async function restore(pageId, trigger, undo) {
       await deleteBlock(tab.id);
       await updateRow(row, { Name: { title: [textRT((UNDONE + rowTitle(row)).slice(0, 60))] } });
       console.log(`undo on ${pageId}: ${created.length} line(s) back`);
-      await pageNote(pageId,
+      await say(
         `↩️ Undid the translation of "${rowTitle(row)}" — the original text is back. / 「${rowTitle(row)}」の翻訳を元に戻しました。`);
       return;
     }
-    await pageNote(pageId, "↩️ No translation to undo on this page. / 元に戻せる翻訳がありません。");
+    await say("↩️ No translation to undo on this page. / 元に戻せる翻訳がありません。");
     return;
   }
 
@@ -1009,7 +1027,7 @@ async function restore(pageId, trigger, undo) {
   }
   const total = rebuilt + stranded;
   console.log(`restore on ${pageId}: ${rebuilt} rebuilt, ${stranded} left at the end`);
-  await pageNote(pageId, total
+  await say(total
     ? `↩️ Restored ${total} translation(s).${stranded ? " Some could not be put back in place and are at the end of the page." : ""} / 翻訳を${total}件復元しました。${stranded ? "一部はページの最後にあります。" : ""}`
     : "↩️ Nothing was deleted, so nothing to restore. To get your original text back instead, write \"↩️ undo\". / 削除された翻訳はありません。翻訳前の文章に戻すには「↩️ 元に戻す」と書いてください。");
 }
@@ -1023,7 +1041,7 @@ async function handleBlock(blockId, pageId, botId) {
 
   const rich = richOf(block);
   const restoreCmd = parseRestore(plainText(rich));
-  if (restoreCmd) return restore(pageId, block, restoreCmd.undo);
+  if (restoreCmd) return restore(pageId, block, restoreCmd.undo, botId);
 
   const trig = trailingFlag(plainText(rich));
   if (!trig) return;
@@ -1048,6 +1066,10 @@ async function handleBlock(blockId, pageId, botId) {
     const { created, replaced } = await refreshTab(loc.tab, edits, skip);
     // Original IDs of a refresh row = the old lines it replaced on purpose
     await logTranslation(pageId, REFRESH_TITLE, loc.tab.tabId, created, replaced);
+    const to = loc.tab.from === "JA" ? "EN" : "JA";
+    const editor = block.last_edited_by?.id;
+    await pageNote(pageId, `🔄 ${LABEL_EN[to]} tab updated / ${LABEL_JA[to]}タブを更新しました`,
+      { userId: editor !== botId ? editor : undefined, blockId: loc.tab.tabId });
     return;
   }
 
@@ -1101,11 +1123,14 @@ async function handleBlock(blockId, pageId, botId) {
   };
   const last = range[range.length - 1];
   const anchor = siblings[siblings.findIndex((b) => b.id === range[0].id) - 1]?.id;
+  // Tag the person who wrote the entry (or, failing that, whoever flagged it)
+  const authorId = [top.created_by?.id, block.last_edited_by?.id].find((id) => id && id !== botId);
   const failed = async (why, tabId) => {
     console.error(`translation not applied (${why}) — originals kept`);
     if (tabId) await deleteBlock(tabId).catch(() => {}); // only ever a verified tab block
     await pageNote(pageId,
-      "⚠️ Translation failed, your text was not changed. / 翻訳に失敗しました。元の文章はそのままです。");
+      "⚠️ Translation failed, your text was not changed. / 翻訳に失敗しました。元の文章はそのままです。",
+      { userId: authorId, blockId: top.id });
   };
   let tabId;
   let created;
@@ -1125,6 +1150,12 @@ async function handleBlock(blockId, pageId, botId) {
   for (const b of range) if (!skip.has(b.id)) await deleteBlock(b.id);
   await logTranslation(pageId, plainText(sourceRich[0] || []), tabId, created, range.map((b) => b.id),
     { anchor, source: srcLang });
+
+  const firstLine = plainText(sourceRich.find((r) => plainText(r).trim()) || []).trim();
+  const quote = firstLine.length > 40 ? `${firstLine.slice(0, 40)}…` : firstLine;
+  await pageNote(pageId,
+    `✅ Translated into ${LABEL_EN[dstLang]}: "${quote}" / ${LABEL_JA[dstLang]}に翻訳しました`,
+    { userId: authorId, blockId: tabId });
 }
 
 async function handlePageEvent(body) {
