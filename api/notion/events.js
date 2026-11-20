@@ -14,13 +14,17 @@
 //     translated in one call; the flag is removed. Headings inside the entry
 //     are translated too. Indentation, checkboxes, bold / colour / highlight
 //     and links are kept. A flag on an indented line takes its whole entry.
-//   • Range: start a line with ▶ (NOTION_RANGE_START) → only the lines from
+//   • Range: put ▶ in a line (NOTION_RANGE_START) → only the lines from
 //     there down to the flag are translated. "▶ one line 🇯🇵" = just that line.
 //   • Inside those tabs, edit one side and end a line with a flag → the
 //     other tab is re-translated from the side you edited.
 //   • Restore: a line that is only ↩️ / restore / 復元 brings back translation
-//     tabs and lines deleted by accident on this page. "↩️ original" also
-//     brings back the pre-translation blocks of the newest translation.
+//     tabs and lines deleted by accident on this page.
+//     "↩️ undo" / "↩️ 元に戻す" undoes the newest translation on the page: the
+//     original text comes back and its tab block is removed.
+//     The bot answers both with a page comment saying what it did.
+//   • Safety: the originals are only trashed once every line is in both tabs.
+//   • ▶ can sit anywhere in the first line ("To：▶11/16 …").
 //     Needs NOTION_LOG_DATABASE_ID: a database shared with the integration,
 //     with properties Name (title), Page ID, Tab ID, Created IDs, Original
 //     IDs (all Text). Without it, translation works and restore is off.
@@ -224,6 +228,15 @@ async function listDiscussion(parentId, discussionId) {
   return all
     .filter((c) => c.discussion_id === discussionId)
     .sort((a, b) => a.created_time.localeCompare(b.created_time));
+}
+
+// A page-level comment: the bot's only way to tell people what it did
+async function pageNote(pageId, text) {
+  if (!pageId) return;
+  await notionFetch("/comments", {
+    method: "POST",
+    body: JSON.stringify({ parent: { page_id: pageId }, rich_text: [textRT(text)] }),
+  }).catch((err) => console.warn("page note failed:", err.message));
 }
 
 async function reply(discussionId, richText) {
@@ -499,13 +512,14 @@ const RANGE_STARTS = (process.env.NOTION_RANGE_START || "▶")
 const noVS = (s) => s.replace(/️/g, "");
 const RESTORE_TRIGGERS = triggerList(process.env.NOTION_TRIGGERS_RESTORE, ["↩️", "↩", "restore", "復元"]);
 const RESTORE_SET = new Set([...RESTORE_TRIGGERS].map(noVS));
-const ORIGINAL_WORDS = new Set(["original", "原文"]);
+// "↩️ undo" (or original / 原文 / 元に戻す) → undo the newest translation
+const UNDO_WORDS = new Set(["undo", "original", "原文", "元に戻す", "もとに戻す"]);
 
 function parseRestore(text) {
   const words = noVS(text.trim().toLowerCase()).split(/\s+/);
   if (!words[0] || !RESTORE_SET.has(words[0])) return null;
-  if (words.length === 1) return { originals: false };
-  if (words.length === 2 && ORIGINAL_WORDS.has(words[1])) return { originals: true };
+  if (words.length === 1) return { undo: false };
+  if (words.length === 2 && UNDO_WORDS.has(words[1])) return { undo: true };
   return null;
 }
 
@@ -534,20 +548,29 @@ function stripTrailingFlag(richText, flag) {
   return rt;
 }
 
+// The ▶ may sit anywhere in the line ("To：▶11/16 …"): the range starts at
+// that line either way.
 function rangeStart(richText) {
-  const first = richText[0];
-  if (!first || first.type !== "text") return null;
-  const t = first.text.content.trimStart();
-  return RANGE_STARTS.find((m) => t.startsWith(m)) || null;
+  for (const r of richText) {
+    if (r.type !== "text") continue;
+    const m = RANGE_STARTS.find((mk) => r.text.content.includes(mk));
+    if (m) return m;
+  }
+  return null;
 }
 
-// Copy of richText without the leading range marker
+// Copy of richText without the range marker (first occurrence)
 function stripRangeStart(richText, marker) {
   const rt = richText.map((r) => structuredClone(r));
-  const c = rt[0].text.content.trimStart().slice(marker.length).trimStart();
-  rt[0].text.content = c;
-  rt[0].plain_text = c;
-  if (!c) rt.shift();
+  const i = rt.findIndex((r) => r.type === "text" && r.text.content.includes(marker));
+  const t = rt[i].text.content;
+  const at = t.indexOf(marker);
+  const before = t.slice(0, at).trimEnd();
+  const after = t.slice(at + marker.length).trimStart();
+  const c = before && after ? `${before} ${after}` : before + after;
+  rt[i].text.content = c;
+  rt[i].plain_text = c;
+  if (!c) rt.splice(i, 1);
   return rt;
 }
 
@@ -703,10 +726,16 @@ async function insertTabs(parentId, afterId, content) {
   });
   const tab = res.results[res.results.length - 1];
   created.push(tab.id);
-  const items = (await listChildren(tab.id)).filter(itemLang);
-  for (const item of items) {
+  // Items were created EN then JA; trust that order if labels don't read back
+  const kids = await listChildren(tab.id);
+  const langs = kids.map(itemLang);
+  const items = langs.includes("EN") && langs.includes("JA")
+    ? kids.filter((k, i) => langs[i])
+    : kids.slice(0, 2);
+  if (kids.length !== 2) console.warn(`tab ${tab.id} has ${kids.length} items, expected 2`);
+  for (const [n, item] of items.entries()) {
     created.push(item.id);
-    const trees = content[itemLang(item)];
+    const trees = content[itemLang(item) || ["EN", "JA"][n]];
     const firstLevel = await listChildren(item.id);
     created.push(...firstLevel.map((b) => b.id));
     for (let k = 0; k < firstLevel.length && k < trees.length; k++) {
@@ -719,10 +748,12 @@ async function insertTabs(parentId, afterId, content) {
   return { tabId: tab.id, created };
 }
 
+// Tab items are written as paragraphs with an icon, but the API may read
+// them back as another type — look at the icon/label, not the type.
 function itemLang(item) {
-  if (item.type !== "paragraph") return null;
-  const emoji = item.paragraph.icon?.emoji;
-  const label = plainText(item.paragraph.rich_text).trim();
+  const data = item[item.type] || {};
+  const emoji = data.icon?.emoji;
+  const label = plainText(data.rich_text).trim();
   if (emoji === FLAG.EN || /^english$/i.test(label)) return "EN";
   if (emoji === FLAG.JA || label === LABEL.JA) return "JA";
   return null;
@@ -745,7 +776,10 @@ async function locate(block) {
       if (from && items.EN && items.JA) return { tab: { tabId: parent.id, items, from } };
       return { top };
     }
-    if (!CONTENT_TYPES.has(parent.type) || isTimestampHeader(parent)) break;
+    // A tab item may not read back as a paragraph: keep climbing through it
+    const icon = parent[parent.type]?.icon?.emoji;
+    const isTabItem = (icon === FLAG.EN || icon === FLAG.JA) && parent.parent.type === "block_id";
+    if (!isTabItem && (!CONTENT_TYPES.has(parent.type) || isTimestampHeader(parent))) break;
     top = parent;
   }
   return { top };
@@ -828,11 +862,17 @@ async function untrash(id) {
   }
 }
 
-// Bring back every logged translation block on this page that was deleted
-// (tab first, then its tabs and lines, in creation order). With `originals`,
-// also bring back the pre-translation text of the newest translation.
-async function restore(pageId, trigger, originals) {
-  if (!LOG_DB) return;
+// "↩️" — bring back translation blocks on this page that a person deleted
+// (tab first, then its tabs and lines, in creation order).
+// "↩️ undo" — undo the newest translation: the original text comes back
+// and its tab block is removed.
+// Either way the bot leaves a page comment saying what happened.
+async function restore(pageId, trigger, undo) {
+  await deleteBlock(trigger.id);
+  if (!LOG_DB) {
+    await pageNote(pageId, "↩️ Restore is not set up (NOTION_LOG_DATABASE_ID). / 復元機能が設定されていません。");
+    return;
+  }
   const rows = await notionFetch(`/data_sources/${await logSourceId()}/query`, {
     method: "POST",
     body: JSON.stringify({
@@ -841,9 +881,26 @@ async function restore(pageId, trigger, originals) {
       page_size: 10,
     }),
   });
-  await deleteBlock(trigger.id);
   const title = (row) => plainText(row.properties.Name?.title);
   const isRefresh = (row) => title(row) === REFRESH_TITLE;
+
+  if (undo) {
+    const newest = rows.results.find((r) => !isRefresh(r));
+    if (!newest) {
+      await pageNote(pageId, "↩️ No translation to undo on this page. / 元に戻せる翻訳がありません。");
+      return;
+    }
+    let back = 0;
+    for (const id of idsOf(newest.properties["Original IDs"])) back += await untrash(id);
+    const tabId = plainText(newest.properties["Tab ID"]?.rich_text);
+    if (back && tabId) await deleteBlock(tabId).catch(() => {});
+    console.log(`undo on ${pageId}: ${back} original block(s) back`);
+    await pageNote(pageId, back
+      ? `↩️ Undid the translation of "${title(newest)}" — the original text is back. / 「${title(newest)}」の翻訳を元に戻しました。`
+      : `↩️ The original text of "${title(newest)}" is already there. / 元の文章はすでにあります。`);
+    return;
+  }
+
   // Lines a tab refresh replaced were deleted by the bot on purpose — skip them
   const replaced = new Set(rows.results.filter(isRefresh).flatMap((r) => idsOf(r.properties["Original IDs"])));
   let restored = 0;
@@ -852,11 +909,10 @@ async function restore(pageId, trigger, originals) {
       if (!replaced.has(id)) restored += await untrash(id);
     }
   }
-  const newest = rows.results.find((r) => !isRefresh(r));
-  if (originals && newest) {
-    for (const id of idsOf(newest.properties["Original IDs"])) restored += await untrash(id);
-  }
   console.log(`restore on ${pageId}: ${restored} block(s) restored`);
+  await pageNote(pageId, restored
+    ? `↩️ Restored ${restored} deleted translation block(s). / 削除された翻訳を${restored}件復元しました。`
+    : "↩️ Nothing was deleted, so nothing to restore. To get your original text back instead, write \"↩️ undo\". / 削除された翻訳はありません。翻訳前の文章に戻すには「↩️ 元に戻す」と書いてください。");
 }
 
 // ── the flag ──
@@ -868,7 +924,7 @@ async function handleBlock(blockId, pageId, botId) {
 
   const rich = richOf(block);
   const restoreCmd = parseRestore(plainText(rich));
-  if (restoreCmd) return restore(pageId, block, restoreCmd.originals);
+  if (restoreCmd) return restore(pageId, block, restoreCmd.undo);
 
   const trig = trailingFlag(plainText(rich));
   if (!trig) return;
@@ -947,8 +1003,19 @@ async function handleBlock(blockId, pageId, botId) {
   const last = range[range.length - 1];
   const { tabId, created } = await insertTabs(parentIdOf(top), last.id, content);
 
+  // Never trash the originals unless every line made it into both tabs
+  // (tab + 2 items + each line twice).
+  const expected = 3 + 2 * lines.length;
+  if (created.length < expected) {
+    console.error(`tab ${tabId} incomplete: ${created.length}/${expected} blocks — originals kept`);
+    await deleteBlock(tabId).catch(() => {});
+    await pageNote(pageId,
+      "⚠️ Translation failed, your text was not changed. / 翻訳に失敗しました。元の文章はそのままです。");
+    return;
+  }
+
   // The originals now live in their tab. Trashed, not destroyed: the
-  // restore log keeps their ids ("↩️ original").
+  // restore log keeps their ids ("↩️ undo").
   for (const b of range) if (!skip.has(b.id)) await deleteBlock(b.id);
   await logTranslation(pageId, plainText(sourceRich[0] || []), tabId, created, range.map((b) => b.id));
 }
