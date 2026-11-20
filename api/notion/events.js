@@ -689,6 +689,31 @@ function mapTree(nodes, richFor) {
   return nodes.map((n) => ({ req: contentBlock(n.block, richFor(n)), children: mapTree(n.children, richFor) }));
 }
 
+// Which blocks did an append just create? The reply may hold only the new
+// blocks or the parent's whole child list (first page), so never assume
+// "the last n": find them right after `after`, or at the end.
+async function appendedBlocks(parentId, res, n, after) {
+  const list = res.results || [];
+  let made;
+  if (after) {
+    let i = list.findIndex((b) => b.id === after);
+    if (i !== -1) made = list.slice(i + 1, i + 1 + n);
+    else if (list.length === n) made = list; // reply holds only the new blocks
+    else {
+      const all = await listChildren(parentId);
+      i = all.findIndex((b) => b.id === after);
+      if (i !== -1) made = all.slice(i + 1, i + 1 + n);
+    }
+  } else {
+    const all = res.has_more ? await listChildren(parentId) : list;
+    made = all.slice(-n);
+  }
+  if (!made || made.length !== n) throw new Error(`could not find the ${n} block(s) just added under ${parentId}`);
+  return made;
+}
+
+const countTrees = (trees) => trees.reduce((c, t) => c + 1 + countTrees(t.children), 0);
+
 // Append request trees under parentId, any depth: one level per request,
 // recursing into the blocks Notion just created. Every created id is pushed
 // to `created` (for the restore log). `after` = id to insert after.
@@ -701,7 +726,7 @@ async function appendTree(parentId, trees, created, after) {
       method: "PATCH",
       body: JSON.stringify(body),
     });
-    const made = res.results.slice(-chunk.length);
+    const made = await appendedBlocks(parentId, res, chunk.length, after);
     for (let k = 0; k < chunk.length; k++) {
       created.push(made[k].id);
       if (chunk[k].children.length) await appendTree(made[k].id, chunk[k].children, created);
@@ -724,8 +749,19 @@ async function insertTabs(parentId, afterId, content) {
       }],
     }),
   });
-  const tab = res.results[res.results.length - 1];
+  const [tab] = await appendedBlocks(parentId, res, 1, afterId);
+  if (tab.type !== "tab") throw new Error(`expected the new tab block, found a ${tab.type}`);
   created.push(tab.id);
+  try {
+    await fillTabs(tab, content, created);
+  } catch (err) {
+    err.tabId = tab.id; // let the caller remove the half-built tab
+    throw err;
+  }
+  return { tabId: tab.id, created };
+}
+
+async function fillTabs(tab, content, created) {
   // Items were created EN then JA; trust that order if labels don't read back
   const kids = await listChildren(tab.id);
   const langs = kids.map(itemLang);
@@ -745,7 +781,6 @@ async function insertTabs(parentId, afterId, content) {
       await appendTree(item.id, trees.slice(100), created, firstLevel[firstLevel.length - 1]?.id);
     }
   }
-  return { tabId: tab.id, created };
 }
 
 // Tab items are written as paragraphs with an icon, but the API may read
@@ -828,7 +863,7 @@ function idsRT(ids) {
 }
 const idsOf = (prop) => plainText(prop?.rich_text).split(",").filter(Boolean);
 
-async function logTranslation(pageId, title, tabId, created, originals) {
+async function logTranslation(pageId, title, tabId, created, originals, extra = {}) {
   if (!LOG_DB) return;
   try {
     await notionFetch("/pages", {
@@ -841,6 +876,8 @@ async function logTranslation(pageId, title, tabId, created, originals) {
           "Tab ID": { rich_text: [textRT(tabId)] },
           "Created IDs": { rich_text: idsRT(created) },
           "Original IDs": { rich_text: idsRT(originals) },
+          ...(extra.anchor ? { "Anchor ID": { rich_text: [textRT(extra.anchor)] } } : {}),
+          ...(extra.source ? { Source: { rich_text: [textRT(extra.source)] } } : {}),
         },
       }),
     });
@@ -850,22 +887,51 @@ async function logTranslation(pageId, title, tabId, created, originals) {
   }
 }
 
-async function untrash(id) {
+const UNDONE = "(undone) ";
+const rowTitle = (row) => plainText(row.properties.Name?.title);
+const rowText = (row, prop) => plainText(row.properties[prop]?.rich_text).trim();
+const isRefreshRow = (row) => rowTitle(row) === REFRESH_TITLE;
+
+async function updateRow(row, properties) {
+  await notionFetch(`/pages/${row.id}`, { method: "PATCH", body: JSON.stringify({ properties }) })
+    .catch((err) => console.warn("log row update failed:", err.message));
+}
+
+async function getBlockOrNull(id) {
+  if (!id) return null;
   try {
-    const b = await notionFetch(`/blocks/${id}`);
-    if (!b.in_trash) return 0;
-    await notionFetch(`/blocks/${id}`, { method: "PATCH", body: JSON.stringify({ in_trash: false }) });
-    return 1;
-  } catch (err) {
-    console.warn(`restore ${id} failed:`, err.message);
-    return 0;
+    return await notionFetch(`/blocks/${id}`);
+  } catch {
+    return null;
   }
 }
 
-// "↩️" — bring back translation blocks on this page that a person deleted
-// (tab first, then its tabs and lines, in creation order).
-// "↩️ undo" — undo the newest translation: the original text comes back
-// and its tab block is removed.
+// Sort each level by the order the bot created the blocks in (blocks it
+// didn't create keep their relative order, after the rest).
+function sortTree(nodes, order) {
+  const rank = (n) => order.get(n.block.id) ?? Infinity;
+  nodes.sort((a, b) => rank(a) - rank(b));
+  nodes.forEach((n) => sortTree(n.children, order));
+  return nodes;
+}
+
+// The current contents of one of our tab blocks, as request trees per language
+async function readTab(tabId, order = new Map()) {
+  const items = (await listChildren(tabId)).slice(0, 2);
+  const content = { EN: [], JA: [] };
+  for (const [n, item] of items.entries()) {
+    const nodes = sortTree(await loadTree(await listChildren(item.id)), order);
+    content[itemLang(item) || ["EN", "JA"][n]] = mapTree(nodes, (x) => x.rich.map(toRequestRT));
+  }
+  return content;
+}
+
+// "↩️" — bring back translation tabs / lines on this page that a person
+// deleted. Notion puts anything taken out of the trash at the END of its
+// parent, so the tab is rebuilt in place: where it was (after the block it
+// followed), with its lines in their original order.
+// "↩️ undo" — undo the newest translation: the original text is rebuilt
+// from the tab's source side, in the tab's place, and the tab is removed.
 // Either way the bot leaves a page comment saying what happened.
 async function restore(pageId, trigger, undo) {
   await deleteBlock(trigger.id);
@@ -873,45 +939,78 @@ async function restore(pageId, trigger, undo) {
     await pageNote(pageId, "↩️ Restore is not set up (NOTION_LOG_DATABASE_ID). / 復元機能が設定されていません。");
     return;
   }
-  const rows = await notionFetch(`/data_sources/${await logSourceId()}/query`, {
+  const rows = (await notionFetch(`/data_sources/${await logSourceId()}/query`, {
     method: "POST",
     body: JSON.stringify({
       filter: { property: "Page ID", rich_text: { equals: pageId } },
       sorts: [{ timestamp: "created_time", direction: "descending" }],
-      page_size: 10,
+      page_size: 20,
     }),
-  });
-  const title = (row) => plainText(row.properties.Name?.title);
-  const isRefresh = (row) => title(row) === REFRESH_TITLE;
+  })).results;
+  const base = rows.filter((r) => !isRefreshRow(r) && !rowTitle(r).startsWith(UNDONE));
 
   if (undo) {
-    const newest = rows.results.find((r) => !isRefresh(r));
-    if (!newest) {
-      await pageNote(pageId, "↩️ No translation to undo on this page. / 元に戻せる翻訳がありません。");
+    for (const row of base) {
+      const tab = await getBlockOrNull(rowText(row, "Tab ID"));
+      if (!tab || tab.type !== "tab" || tab.in_trash) continue; // only a live tab can be undone
+      let source = rowText(row, "Source");
+      if (!source) {
+        const first = await getBlockOrNull(idsOf(row.properties["Original IDs"])[0]);
+        source = first ? detectLang(plainText(richOf(first))) : "JA";
+      }
+      const trees = (await readTab(tab.id))[source] || [];
+      const created = [];
+      await appendTree(parentIdOf(tab), trees, created, tab.id);
+      if (created.length !== countTrees(trees)) throw new Error("undo: not every line could be rebuilt");
+      await deleteBlock(tab.id);
+      await updateRow(row, { Name: { title: [textRT((UNDONE + rowTitle(row)).slice(0, 60))] } });
+      console.log(`undo on ${pageId}: ${created.length} line(s) back`);
+      await pageNote(pageId,
+        `↩️ Undid the translation of "${rowTitle(row)}" — the original text is back. / 「${rowTitle(row)}」の翻訳を元に戻しました。`);
       return;
     }
-    let back = 0;
-    for (const id of idsOf(newest.properties["Original IDs"])) back += await untrash(id);
-    const tabId = plainText(newest.properties["Tab ID"]?.rich_text);
-    if (back && tabId) await deleteBlock(tabId).catch(() => {});
-    console.log(`undo on ${pageId}: ${back} original block(s) back`);
-    await pageNote(pageId, back
-      ? `↩️ Undid the translation of "${title(newest)}" — the original text is back. / 「${title(newest)}」の翻訳を元に戻しました。`
-      : `↩️ The original text of "${title(newest)}" is already there. / 元の文章はすでにあります。`);
+    await pageNote(pageId, "↩️ No translation to undo on this page. / 元に戻せる翻訳がありません。");
     return;
   }
 
   // Lines a tab refresh replaced were deleted by the bot on purpose — skip them
-  const replaced = new Set(rows.results.filter(isRefresh).flatMap((r) => idsOf(r.properties["Original IDs"])));
-  let restored = 0;
-  for (const row of rows.results) {
-    for (const id of idsOf(row.properties["Created IDs"])) {
-      if (!replaced.has(id)) restored += await untrash(id);
+  const replaced = new Set(rows.filter(isRefreshRow).flatMap((r) => idsOf(r.properties["Original IDs"])));
+  let rebuilt = 0;
+  let stranded = 0;
+  for (const row of base) {
+    const tabId = rowText(row, "Tab ID");
+    const tab = await getBlockOrNull(tabId);
+    if (!tab || tab.type !== "tab") continue; // never touch anything but our own tab blocks
+    // Every block ever created in this tab, oldest first (creation order)
+    const ids = rows.filter((r) => rowText(r, "Tab ID") === tabId).reverse()
+      .flatMap((r) => idsOf(r.properties["Created IDs"])).filter((id) => !replaced.has(id));
+    let back = 0;
+    for (const id of ids) {
+      const b = await getBlockOrNull(id);
+      if (!b?.in_trash) continue;
+      await notionFetch(`/blocks/${id}`, { method: "PATCH", body: JSON.stringify({ in_trash: false }) });
+      back++;
     }
+    if (!back) continue;
+
+    const anchor = tab.in_trash ? await getBlockOrNull(rowText(row, "Anchor ID")) : tab;
+    if (!anchor || anchor.in_trash) { // can't tell where it was: left at the end
+      stranded++;
+      continue;
+    }
+    const content = await readTab(tabId, new Map(ids.map((id, i) => [id, i])));
+    const fresh = await insertTabs(parentIdOf(tab), anchor.id, content);
+    await deleteBlock(tabId);
+    await updateRow(row, {
+      "Tab ID": { rich_text: [textRT(fresh.tabId)] },
+      "Created IDs": { rich_text: idsRT(fresh.created) },
+    });
+    rebuilt++;
   }
-  console.log(`restore on ${pageId}: ${restored} block(s) restored`);
-  await pageNote(pageId, restored
-    ? `↩️ Restored ${restored} deleted translation block(s). / 削除された翻訳を${restored}件復元しました。`
+  const total = rebuilt + stranded;
+  console.log(`restore on ${pageId}: ${rebuilt} rebuilt, ${stranded} left at the end`);
+  await pageNote(pageId, total
+    ? `↩️ Restored ${total} translation(s).${stranded ? " Some could not be put back in place and are at the end of the page." : ""} / 翻訳を${total}件復元しました。${stranded ? "一部はページの最後にあります。" : ""}`
     : "↩️ Nothing was deleted, so nothing to restore. To get your original text back instead, write \"↩️ undo\". / 削除された翻訳はありません。翻訳前の文章に戻すには「↩️ 元に戻す」と書いてください。");
 }
 
@@ -1001,23 +1100,31 @@ async function handleBlock(blockId, pageId, botId) {
     [dstLang]: mapTree(nodes, (n) => byNode.get(n)),
   };
   const last = range[range.length - 1];
-  const { tabId, created } = await insertTabs(parentIdOf(top), last.id, content);
+  const anchor = siblings[siblings.findIndex((b) => b.id === range[0].id) - 1]?.id;
+  const failed = async (why, tabId) => {
+    console.error(`translation not applied (${why}) — originals kept`);
+    if (tabId) await deleteBlock(tabId).catch(() => {}); // only ever a verified tab block
+    await pageNote(pageId,
+      "⚠️ Translation failed, your text was not changed. / 翻訳に失敗しました。元の文章はそのままです。");
+  };
+  let tabId;
+  let created;
+  try {
+    ({ tabId, created } = await insertTabs(parentIdOf(top), last.id, content));
+  } catch (err) {
+    return failed(err.message, err.tabId);
+  }
 
   // Never trash the originals unless every line made it into both tabs
   // (tab + 2 items + each line twice).
   const expected = 3 + 2 * lines.length;
-  if (created.length < expected) {
-    console.error(`tab ${tabId} incomplete: ${created.length}/${expected} blocks — originals kept`);
-    await deleteBlock(tabId).catch(() => {});
-    await pageNote(pageId,
-      "⚠️ Translation failed, your text was not changed. / 翻訳に失敗しました。元の文章はそのままです。");
-    return;
-  }
+  if (created.length < expected) return failed(`tab incomplete: ${created.length}/${expected} blocks`, tabId);
 
   // The originals now live in their tab. Trashed, not destroyed: the
   // restore log keeps their ids ("↩️ undo").
   for (const b of range) if (!skip.has(b.id)) await deleteBlock(b.id);
-  await logTranslation(pageId, plainText(sourceRich[0] || []), tabId, created, range.map((b) => b.id));
+  await logTranslation(pageId, plainText(sourceRich[0] || []), tabId, created, range.map((b) => b.id),
+    { anchor, source: srcLang });
 }
 
 async function handlePageEvent(body) {
