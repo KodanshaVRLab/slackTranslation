@@ -8,13 +8,22 @@
 // IN THE PAGE BODY (page.content_updated) — e.g. under a "new Timestamp" entry:
 //   • A text block ending with a flag ("Ami is not moving 🇯🇵"), or
 //   • a block that is only a flag, right under the text block to translate
-//   → the whole entry (every text block from the heading above — normally the
-//     "new Timestamp" heading — down to the flag) is replaced by a tab block
-//     🇬🇧 English | 🇯🇵 日本語 holding the original and the translation,
-//     translated in one call; the flag is removed. Nested blocks are kept
-//     but flattened.
+//   → the whole entry (every block from the "@Name : @Now" timestamp bar —
+//     or the previous non-text block — down to the flag) is replaced by a tab
+//     block 🇬🇧 English | 🇯🇵 日本語 holding the original and the translation,
+//     translated in one call; the flag is removed. Headings inside the entry
+//     are translated too. Indentation, checkboxes, bold / colour / highlight
+//     and links are kept. A flag on an indented line takes its whole entry.
+//   • Range: start a line with ▶ (NOTION_RANGE_START) → only the lines from
+//     there down to the flag are translated. "▶ one line 🇯🇵" = just that line.
 //   • Inside those tabs, edit one side and end a line with a flag → the
 //     other tab is re-translated from the side you edited.
+//   • Restore: a line that is only ↩️ / restore / 復元 brings back translation
+//     tabs and lines deleted by accident on this page. "↩️ original" also
+//     brings back the pre-translation blocks of the newest translation.
+//     Needs NOTION_LOG_DATABASE_ID: a database shared with the integration,
+//     with properties Name (title), Page ID, Tab ID, Created IDs, Original
+//     IDs (all Text). Without it, translation works and restore is off.
 //
 // IN COMMENTS (comment.created) — the comment text can also be a keyword
 // (ja / jp / japanese / 日本語, en / english / 英語):
@@ -69,6 +78,7 @@ const COMMENT_SYSTEM_PROMPT = `You are a translation engine embedded in a Notion
 Rules:
 - Output ONLY the translated text. No preamble, no explanation, no quotes around it.
 - Preserve placeholder tokens exactly as they appear, e.g. <x id="0"/> — never translate, remove, or reorder their content, but do place them naturally in the translated sentence.
+- Formatted text is wrapped like <s id="1">text</s>. Keep every such tag pair with its id, translate the text inside it, and wrap the words of the translation that correspond to it. Tags may move to fit the target word order, but never drop, merge, or nest them.
 - Text may be split into blocks, each starting with a marker line like <b id="0"/>. Keep every marker exactly, in the same order, each on its own line, and put the translation of that block after it. Never merge or split blocks.
 - Use natural, professional-but-casual workplace tone. For Japanese output, prefer plain/casual form over formal keigo unless the source is clearly formal.
 - Preserve technical terms, product names, and code identifiers (e.g. Unity, PICO, NGO, Timeline, variable names) unchanged.
@@ -119,7 +129,7 @@ function verifyNotionSignature(req, rawBody) {
   }
 }
 
-async function notionFetch(path, options = {}) {
+async function notionFetch(path, options = {}, attempt = 0) {
   const res = await fetch(`${NOTION}${path}`, {
     ...options,
     headers: {
@@ -129,6 +139,12 @@ async function notionFetch(path, options = {}) {
       ...options.headers,
     },
   });
+  // Rate limited (~3 req/s): wait as told and retry a few times
+  if (res.status === 429 && attempt < 4) {
+    const wait = Number(res.headers.get("retry-after")) || 1;
+    await new Promise((r) => setTimeout(r, wait * 1000));
+    return notionFetch(path, options, attempt + 1);
+  }
   if (!res.ok) throw new Error(`Notion ${res.status}: ${await res.text()}`);
   return res.json();
 }
@@ -219,18 +235,37 @@ async function reply(discussionId, richText) {
 
 const textRT = (content) => ({ type: "text", text: { content } });
 
-// Mentions, equations and links must survive translation untouched: swap them
-// for <x id="n"/> placeholders, translate, then put the originals back.
+const isPlainStyle = (a) =>
+  !a || (!a.bold && !a.italic && !a.strikethrough && !a.underline && !a.code &&
+    (a.color || "default") === "default");
+
+// Mentions, equations and inline code must survive translation untouched:
+// swap them for <x id="n"/> placeholders, translate, then put them back.
+// Styled text (bold, colour, highlight, link…) is translated but keeps its
+// style: it is wrapped as <s id="n">text</s> and re-styled afterwards.
 function richTextToTagged(richText, tokens = []) {
   const text = richText
     .map((rt) => {
-      if (rt.type === "text" && !rt.text.link) return rt.text.content;
+      if (rt.type === "text" && !rt.annotations?.code) {
+        if (!rt.text.link && isPlainStyle(rt.annotations)) return rt.text.content;
+        tokens.push(rt);
+        return `<s id="${tokens.length - 1}">${rt.text.content}</s>`;
+      }
       tokens.push(rt);
       return `<x id="${tokens.length - 1}"/>`;
     })
     .join("");
   return { text, tokens };
 }
+
+// Tag leftovers the model mangled (unpaired <s>, </s>) → dropped, text kept
+const stripStrayTags = (s) => s.replace(/<\/?s(?:\s+id="\d+")?\s*\/?>/g, "");
+const untag = (text, tokens) =>
+  stripStrayTags(
+    text
+      .replace(/<x id="(\d+)"\s*\/>/g, (_, i) => tokens[Number(i)]?.plain_text ?? "")
+      .replace(/<s id="\d+">([\s\S]*?)<\/s>/g, "$1")
+  );
 
 // Response-shaped rich text → request-shaped rich text
 function toRequestRT(rt) {
@@ -258,17 +293,33 @@ function toRequestRT(rt) {
 
 function taggedToRichText(text, tokens) {
   const out = [];
-  const parts = text.split(/<x id="(\d+)"\s*\/>/);
-  parts.forEach((part, i) => {
-    if (i % 2 === 1) {
-      const tok = tokens[Number(part)];
-      if (tok) out.push(toRequestRT(tok));
-      return;
+  // Notion caps each text object at 2000 characters
+  const pushText = (content, style) => {
+    for (let p = 0; p < content.length; p += 2000) {
+      const piece = content.slice(p, p + 2000);
+      out.push(
+        style
+          ? { type: "text", text: { content: piece, link: style.text.link }, annotations: style.annotations }
+          : textRT(piece)
+      );
     }
-    // Notion caps each text object at 2000 characters
-    for (let p = 0; p < part.length; p += 2000) out.push(textRT(part.slice(p, p + 2000)));
-  });
-  return out.slice(0, 100); // and a comment at 100 rich text objects
+  };
+  const re = /<x id="(\d+)"\s*\/>|<s id="(\d+)">([\s\S]*?)<\/s>/g;
+  let last = 0;
+  let m;
+  while ((m = re.exec(text))) {
+    pushText(stripStrayTags(text.slice(last, m.index)));
+    if (m[1] !== undefined) {
+      const tok = tokens[Number(m[1])];
+      if (tok) out.push(toRequestRT(tok));
+    } else {
+      const tok = tokens[Number(m[2])];
+      pushText(stripStrayTags(m[3]), tok?.type === "text" ? tok : null);
+    }
+    last = re.lastIndex;
+  }
+  pushText(stripStrayTags(text.slice(last)));
+  return out.slice(0, 100); // and a block/comment at 100 rich text objects
 }
 
 async function translateComment(thread, triggerIdx, lang, botId) {
@@ -302,7 +353,7 @@ async function translateComment(thread, triggerIdx, lang, botId) {
   } catch (err) {
     // Fall back to plain text if a mention couldn't be re-created
     console.warn("rich reply failed, retrying as plain text:", err.message);
-    const plain = translated.replace(/<x id="(\d+)"\s*\/>/g, (_, i) => tokens[Number(i)]?.plain_text ?? "");
+    const plain = untag(translated, tokens);
     await reply(source.discussion_id, taggedToRichText(`${FLAG[lang]} ${plain}`, []));
   }
 }
@@ -436,9 +487,27 @@ async function translatePage(pageId, lang) {
 const BLOCK_FLAGS = [["🇯🇵", "JA"], ["🇬🇧", "EN"], ["🇺🇸", "EN"]];
 const CONTENT_TYPES = new Set([
   "paragraph", "bulleted_list_item", "numbered_list_item", "to_do",
-  "quote", "callout", "heading_1", "heading_2", "heading_3",
+  "quote", "callout", "toggle", "heading_1", "heading_2", "heading_3",
 ]);
 const HAS_WORDS = /[a-zA-Z぀-ゟ゠-ヿ一-鿿]/;
+
+// "▶ first line … last line 🇬🇧" → only that range is translated
+const RANGE_STARTS = (process.env.NOTION_RANGE_START || "▶")
+  .split(",").map((s) => s.trim()).filter(Boolean);
+
+// A block that is only "↩️" / "restore" / "復元" brings back deleted translations
+const noVS = (s) => s.replace(/️/g, "");
+const RESTORE_TRIGGERS = triggerList(process.env.NOTION_TRIGGERS_RESTORE, ["↩️", "↩", "restore", "復元"]);
+const RESTORE_SET = new Set([...RESTORE_TRIGGERS].map(noVS));
+const ORIGINAL_WORDS = new Set(["original", "原文"]);
+
+function parseRestore(text) {
+  const words = noVS(text.trim().toLowerCase()).split(/\s+/);
+  if (!words[0] || !RESTORE_SET.has(words[0])) return null;
+  if (words.length === 1) return { originals: false };
+  if (words.length === 2 && ORIGINAL_WORDS.has(words[1])) return { originals: true };
+  return null;
+}
 
 function trailingFlag(text) {
   const t = text.trimEnd();
@@ -465,6 +534,23 @@ function stripTrailingFlag(richText, flag) {
   return rt;
 }
 
+function rangeStart(richText) {
+  const first = richText[0];
+  if (!first || first.type !== "text") return null;
+  const t = first.text.content.trimStart();
+  return RANGE_STARTS.find((m) => t.startsWith(m)) || null;
+}
+
+// Copy of richText without the leading range marker
+function stripRangeStart(richText, marker) {
+  const rt = richText.map((r) => structuredClone(r));
+  const c = rt[0].text.content.trimStart().slice(marker.length).trimStart();
+  rt[0].text.content = c;
+  rt[0].plain_text = c;
+  if (!c) rt.shift();
+  return rt;
+}
+
 const parentIdOf = (b) =>
   b.parent.type === "page_id" ? b.parent.page_id
   : b.parent.type === "block_id" ? b.parent.block_id
@@ -484,6 +570,18 @@ async function listChildren(blockId) {
 }
 
 const deleteBlock = (id) => notionFetch(`/blocks/${id}`, { method: "DELETE" });
+const richOf = (b) => b[b.type]?.rich_text || [];
+
+// The "@Name : @Today 3:53 PM" bar that opens every entry
+function isTimestampHeader(b) {
+  const kinds = new Set(richOf(b).filter((r) => r.type === "mention").map((r) => r.mention.type));
+  return kinds.has("user") && kinds.has("date");
+}
+
+// An entry runs from the block after its timestamp bar (or any non-text
+// block: a tab block, divider, image…) down to the flag. Ordinary headings
+// are part of the entry.
+const isEntryBoundary = (b) => !CONTENT_TYPES.has(b.type) || isTimestampHeader(b);
 
 // A request-shaped block of the same kind as src, with new rich text
 function contentBlock(src, richText) {
@@ -491,6 +589,7 @@ function contentBlock(src, richText) {
   const body = { rich_text: richText, color: src[src.type]?.color || "default" };
   if (type === "to_do") body.checked = !!src.to_do.checked;
   if (type === "callout" && src.callout.icon?.type === "emoji") body.icon = src.callout.icon;
+  if (type.startsWith("heading_") && src[type].is_toggleable) body.is_toggleable = true;
   return { type, [type]: body };
 }
 
@@ -533,6 +632,9 @@ async function translateRichList(list, lang) {
 
   if (!result.truncated && idx.every((_, n) => n in got)) {
     idx.forEach((i, n) => (out[i] = taggedToRichText(got[n], tokens)));
+    const styled = (source.match(/<s id="/g) || []).length;
+    const kept = (result.text.match(/<s id="\d+">[\s\S]*?<\/s>/g) || []).length;
+    if (kept < styled) console.warn(`formatting tags lost: ${kept}/${styled} kept`);
   } else {
     console.warn("block markers lost, translating block by block");
     for (const i of idx) out[i] = await translateRich(list[i], lang);
@@ -540,21 +642,82 @@ async function translateRichList(list, lang) {
   return out;
 }
 
-// Blocks in document order, nested children flattened right after their
-// parent (a tab item can't take the deeper nesting in one request, and
-// flattening keeps the text instead of dropping it).
-async function flattenBlocks(blocks) {
-  const flat = [];
+// ── block trees (nesting is kept, not flattened) ──
+// node = { block, rich, children: [node] }; `edits` overrides a block's rich
+// text by id (flag / range marker stripped), `skip` drops blocks by id.
+
+async function loadTree(blocks, edits = {}, skip = new Set()) {
+  const nodes = [];
   for (const b of blocks) {
-    if (!CONTENT_TYPES.has(b.type)) continue;
-    flat.push(b);
-    if (b.has_children) flat.push(...(await flattenBlocks(await listChildren(b.id))));
+    if (!CONTENT_TYPES.has(b.type) || skip.has(b.id)) continue;
+    nodes.push({
+      block: b,
+      rich: edits[b.id] || richOf(b),
+      children: b.has_children ? await loadTree(await listChildren(b.id), edits, skip) : [],
+    });
   }
-  return flat;
+  return nodes;
 }
 
-const isBoundary = (b) =>
-  !CONTENT_TYPES.has(b.type) || b.type.startsWith("heading_");
+const flattenTree = (nodes) => nodes.flatMap((n) => [n, ...flattenTree(n.children)]);
+
+// Same shape, with each block's rich text replaced by richFor(node)
+function mapTree(nodes, richFor) {
+  return nodes.map((n) => ({ req: contentBlock(n.block, richFor(n)), children: mapTree(n.children, richFor) }));
+}
+
+// Append request trees under parentId, any depth: one level per request,
+// recursing into the blocks Notion just created. Every created id is pushed
+// to `created` (for the restore log). `after` = id to insert after.
+async function appendTree(parentId, trees, created, after) {
+  for (let i = 0; i < trees.length; i += 100) {
+    const chunk = trees.slice(i, i + 100);
+    const body = { children: chunk.map((t) => t.req) };
+    if (after) body.position = { type: "after_block", after_block: { id: after } };
+    const res = await notionFetch(`/blocks/${parentId}/children`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    });
+    const made = res.results.slice(-chunk.length);
+    for (let k = 0; k < chunk.length; k++) {
+      created.push(made[k].id);
+      if (chunk[k].children.length) await appendTree(made[k].id, chunk[k].children, created);
+    }
+    if (after) after = made[made.length - 1].id;
+  }
+}
+
+// Insert a 🇬🇧 | 🇯🇵 tab block after `afterId`, each tab holding its tree
+async function insertTabs(parentId, afterId, content) {
+  const created = [];
+  const res = await notionFetch(`/blocks/${parentId}/children`, {
+    method: "PATCH",
+    body: JSON.stringify({
+      position: { type: "after_block", after_block: { id: afterId } },
+      children: [{
+        type: "tab",
+        // Tab + items + first level of content fit in one request (2 levels)
+        tab: { children: ["EN", "JA"].map((l) => tabItem(l, content[l].slice(0, 100).map((t) => t.req))) },
+      }],
+    }),
+  });
+  const tab = res.results[res.results.length - 1];
+  created.push(tab.id);
+  const items = (await listChildren(tab.id)).filter(itemLang);
+  for (const item of items) {
+    created.push(item.id);
+    const trees = content[itemLang(item)];
+    const firstLevel = await listChildren(item.id);
+    created.push(...firstLevel.map((b) => b.id));
+    for (let k = 0; k < firstLevel.length && k < trees.length; k++) {
+      if (trees[k].children.length) await appendTree(firstLevel[k].id, trees[k].children, created);
+    }
+    if (trees.length > 100) {
+      await appendTree(item.id, trees.slice(100), created, firstLevel[firstLevel.length - 1]?.id);
+    }
+  }
+  return { tabId: tab.id, created };
+}
 
 function itemLang(item) {
   if (item.type !== "paragraph") return null;
@@ -565,119 +728,238 @@ function itemLang(item) {
   return null;
 }
 
-// If block sits directly inside one of our EN/JA tabs, return that context
-async function findTabContext(block) {
-  if (block.parent.type !== "block_id") return null;
-  const item = await notionFetch(`/blocks/${block.parent.block_id}`);
-  if (item.type !== "paragraph" || item.parent.type !== "block_id") return null;
-  const tab = await notionFetch(`/blocks/${item.parent.block_id}`);
-  if (tab.type !== "tab") return null;
-  const items = {};
-  for (const it of await listChildren(tab.id)) {
-    const lang = itemLang(it);
-    if (lang) items[lang] = it;
+// Walk up from a block to the one sitting directly in the entry's container
+// (the page, a column…), so an indented line brings its whole entry along.
+// If the block lives inside one of our EN/JA tabs, returns that tab instead.
+async function locate(block) {
+  let top = block;
+  while (top.parent.type === "block_id") {
+    const parent = await notionFetch(`/blocks/${top.parent.block_id}`);
+    if (parent.type === "tab") {
+      const from = itemLang(top);
+      const items = {};
+      for (const it of await listChildren(parent.id)) {
+        const lang = itemLang(it);
+        if (lang) items[lang] = it;
+      }
+      if (from && items.EN && items.JA) return { tab: { tabId: parent.id, items, from } };
+      return { top };
+    }
+    if (!CONTENT_TYPES.has(parent.type) || isTimestampHeader(parent)) break;
+    top = parent;
   }
-  const from = itemLang(item);
-  if (!items.EN || !items.JA || !from) return null;
-  return { items, from };
+  return { top };
 }
 
 // Re-translate the other tab from the whole tab the person edited
-async function refreshTab(ctx) {
+async function refreshTab(ctx, edits, skip) {
   const to = ctx.from === "JA" ? "EN" : "JA";
-  const sourceBlocks = await flattenBlocks(await listChildren(ctx.items[ctx.from].id));
-  const rich = await translateRichList(sourceBlocks.map((b) => b[b.type].rich_text || []), to);
-  const translated = sourceBlocks.map((b, i) => contentBlock(b, rich[i]));
-  for (const old of await listChildren(ctx.items[to].id)) await deleteBlock(old.id);
-  if (translated.length) {
-    await notionFetch(`/blocks/${ctx.items[to].id}/children`, {
-      method: "PATCH",
-      body: JSON.stringify({ children: translated.slice(0, 100) }),
+  const nodes = await loadTree(await listChildren(ctx.items[ctx.from].id), edits, skip);
+  const flat = flattenTree(nodes);
+  const rich = await translateRichList(flat.map((n) => n.rich), to);
+  const byNode = new Map(flat.map((n, i) => [n, rich[i]]));
+  const replaced = [];
+  for (const old of await listChildren(ctx.items[to].id)) {
+    await deleteBlock(old.id);
+    replaced.push(old.id);
+  }
+  const created = [];
+  await appendTree(ctx.items[to].id, mapTree(nodes, (n) => byNode.get(n)), created);
+  return { created, replaced };
+}
+
+const REFRESH_TITLE = "(tab refresh)";
+
+// ── restore log (a Notion database; off when NOTION_LOG_DATABASE_ID is unset) ──
+// Properties: Name (title), Page ID, Tab ID, Created IDs, Original IDs (text)
+
+const LOG_DB = process.env.NOTION_LOG_DATABASE_ID;
+let cachedLogSource = null;
+
+async function logSourceId() {
+  if (!cachedLogSource) {
+    const db = await notionFetch(`/databases/${LOG_DB}`);
+    cachedLogSource = db.data_sources?.[0]?.id;
+    if (!cachedLogSource) throw new Error("log database has no data source");
+  }
+  return cachedLogSource;
+}
+
+// Long id lists → several ≤2000-char rich text items
+function idsRT(ids) {
+  const s = ids.join(",");
+  const out = [];
+  for (let p = 0; p < s.length && out.length < 100; p += 2000) out.push(textRT(s.slice(p, p + 2000)));
+  return out;
+}
+const idsOf = (prop) => plainText(prop?.rich_text).split(",").filter(Boolean);
+
+async function logTranslation(pageId, title, tabId, created, originals) {
+  if (!LOG_DB) return;
+  try {
+    await notionFetch("/pages", {
+      method: "POST",
+      body: JSON.stringify({
+        parent: { type: "data_source_id", data_source_id: await logSourceId() },
+        properties: {
+          Name: { title: [textRT(title.slice(0, 50) || "(untitled)")] },
+          "Page ID": { rich_text: [textRT(pageId)] },
+          "Tab ID": { rich_text: [textRT(tabId)] },
+          "Created IDs": { rich_text: idsRT(created) },
+          "Original IDs": { rich_text: idsRT(originals) },
+        },
+      }),
     });
+  } catch (err) {
+    // The translation itself already succeeded — don't fail it over the log
+    console.error("restore log write failed:", err.message);
   }
 }
 
-async function handleBlock(blockId, botId) {
+async function untrash(id) {
+  try {
+    const b = await notionFetch(`/blocks/${id}`);
+    if (!b.in_trash) return 0;
+    await notionFetch(`/blocks/${id}`, { method: "PATCH", body: JSON.stringify({ in_trash: false }) });
+    return 1;
+  } catch (err) {
+    console.warn(`restore ${id} failed:`, err.message);
+    return 0;
+  }
+}
+
+// Bring back every logged translation block on this page that was deleted
+// (tab first, then its tabs and lines, in creation order). With `originals`,
+// also bring back the pre-translation text of the newest translation.
+async function restore(pageId, trigger, originals) {
+  if (!LOG_DB) return;
+  const rows = await notionFetch(`/data_sources/${await logSourceId()}/query`, {
+    method: "POST",
+    body: JSON.stringify({
+      filter: { property: "Page ID", rich_text: { equals: pageId } },
+      sorts: [{ timestamp: "created_time", direction: "descending" }],
+      page_size: 10,
+    }),
+  });
+  await deleteBlock(trigger.id);
+  const title = (row) => plainText(row.properties.Name?.title);
+  const isRefresh = (row) => title(row) === REFRESH_TITLE;
+  // Lines a tab refresh replaced were deleted by the bot on purpose — skip them
+  const replaced = new Set(rows.results.filter(isRefresh).flatMap((r) => idsOf(r.properties["Original IDs"])));
+  let restored = 0;
+  for (const row of rows.results) {
+    for (const id of idsOf(row.properties["Created IDs"])) {
+      if (!replaced.has(id)) restored += await untrash(id);
+    }
+  }
+  const newest = rows.results.find((r) => !isRefresh(r));
+  if (originals && newest) {
+    for (const id of idsOf(newest.properties["Original IDs"])) restored += await untrash(id);
+  }
+  console.log(`restore on ${pageId}: ${restored} block(s) restored`);
+}
+
+// ── the flag ──
+
+async function handleBlock(blockId, pageId, botId) {
   const block = await notionFetch(`/blocks/${blockId}`);
   if (!CONTENT_TYPES.has(block.type) || block.in_trash) return;
   if (block.last_edited_by?.id === botId) return; // our own edit → no loop
 
-  const rich = block[block.type].rich_text || [];
+  const rich = richOf(block);
+  const restoreCmd = parseRestore(plainText(rich));
+  if (restoreCmd) return restore(pageId, block, restoreCmd.originals);
+
   const trig = trailingFlag(plainText(rich));
   if (!trig) return;
+  if (isTimestampHeader(block)) return; // nothing to translate, leave the flag
 
-  // The flag sits on the last block of the entry, or alone right under it
-  const siblings = await listChildren(parentIdOf(block));
-  const at = siblings.findIndex((b) => b.id === block.id);
-  let source = block;
-  let sourceRich = stripTrailingFlag(rich, trig.flag);
-  let flagBlock = null;
-  let end = at;
-  if (trig.only) {
-    end = at - 1;
-    const prev = siblings[end];
-    if (!prev || !CONTENT_TYPES.has(prev.type)) return;
-    source = prev;
-    sourceRich = prev[prev.type].rich_text || [];
-    flagBlock = block;
+  const edits = {};
+  const skip = new Set();
+  if (trig.only) skip.add(block.id);
+  else edits[block.id] = stripTrailingFlag(rich, trig.flag);
+
+  const removeFlag = () =>
+    trig.only
+      ? deleteBlock(block.id)
+      : notionFetch(`/blocks/${block.id}`, {
+          method: "PATCH",
+          body: JSON.stringify({ [block.type]: { rich_text: edits[block.id].map(toRequestRT) } }),
+        });
+
+  const loc = await locate(block);
+  if (loc.tab) {
+    await removeFlag();
+    const { created, replaced } = await refreshTab(loc.tab, edits, skip);
+    // Original IDs of a refresh row = the old lines it replaced on purpose
+    await logTranslation(pageId, REFRESH_TITLE, loc.tab.tabId, created, replaced);
+    return;
   }
 
-  // Remove the flag the person typed (it was the "reaction")
-  if (flagBlock) await deleteBlock(flagBlock.id);
-  else {
-    await notionFetch(`/blocks/${block.id}`, {
-      method: "PATCH",
-      body: JSON.stringify({ [block.type]: { rich_text: sourceRich.map(toRequestRT) } }),
-    });
-  }
-
-  const ctx = await findTabContext(source);
-  if (ctx) return refreshTab(ctx);
-
-  // The whole entry: walk up from the flagged block to the previous heading
-  // (the "new Timestamp" heading), tab block, or any non-text block.
-  if (source.type.startsWith("heading_")) return; // a flag right under the timestamp
+  // The entry, as top-level blocks of the container: from just after the
+  // timestamp bar (or a ▶ range marker) down to the flagged block.
+  const top = loc.top;
+  const siblings = await listChildren(parentIdOf(top));
+  let end = siblings.findIndex((b) => b.id === top.id);
+  if (end === -1) return;
+  if (top.id === block.id && trig.only) end--; // flag alone on its line → the block above
+  if (end < 0 || isEntryBoundary(siblings[end])) return;
   let start = end;
-  while (start > 0 && !isBoundary(siblings[start - 1])) start--;
-  const range = siblings.slice(start, end + 1);
-  range[range.length - 1] = { ...source, [source.type]: { ...source[source.type], rich_text: sourceRich } };
-  // Trim empty lines at the start of the entry
-  while (range.length > 1 && !plainText(range[0][range[0].type].rich_text).trim() && !range[0].has_children) {
+  while (start > 0 && !isEntryBoundary(siblings[start - 1])) start--;
+
+  let range = siblings.slice(start, end + 1);
+  let nodes = await loadTree(range, edits, skip);
+
+  // A ▶ marker (on any line, indented or not) narrows the range to start at
+  // the top-level block holding it. The last marker before the flag wins.
+  // (range and nodes are 1:1: every block in range is a content block.)
+  const flat = flattenTree(nodes);
+  for (let i = flat.length - 1; i >= 0; i--) {
+    const marker = rangeStart(flat[i].rich);
+    if (!marker) continue;
+    flat[i].rich = stripRangeStart(flat[i].rich, marker);
+    const owner = nodes.findIndex((n) => flattenTree([n]).includes(flat[i]));
+    range = range.slice(owner);
+    nodes = nodes.slice(owner);
+    break;
+  }
+  // Leave empty lines at the start of the entry where they are
+  while (nodes.length > 1 && !plainText(nodes[0].rich).trim() && !nodes[0].children.length) {
+    nodes.shift();
     range.shift();
   }
 
-  const blocks = await flattenBlocks(range);
-  const sourceRichList = blocks.map((b) => b[b.type].rich_text || []);
-  const allText = sourceRichList.map(plainText).join("\n");
+  const lines = flattenTree(nodes);
+  const sourceRich = lines.map((n) => n.rich);
+  const allText = sourceRich.map(plainText).join("\n");
   if (!HAS_WORDS.test(allText)) return;
+
+  await removeFlag(); // claim it first, so a repeated webhook finds nothing to do
 
   const srcLang = detectLang(allText);
   const dstLang = srcLang === "JA" ? "EN" : "JA";
-  const translatedRich = await translateRichList(sourceRichList, dstLang);
+  const translated = await translateRichList(sourceRich, dstLang);
+  const byNode = new Map(lines.map((n, i) => [n, translated[i]]));
   const content = {
-    [srcLang]: blocks.map((b, i) => contentBlock(b, sourceRichList[i].map(toRequestRT))),
-    [dstLang]: blocks.map((b, i) => contentBlock(b, translatedRich[i])),
+    [srcLang]: mapTree(nodes, (n) => n.rich.map(toRequestRT)),
+    [dstLang]: mapTree(nodes, (n) => byNode.get(n)),
   };
-  await notionFetch(`/blocks/${parentIdOf(source)}/children`, {
-    method: "PATCH",
-    body: JSON.stringify({
-      position: { type: "after_block", after_block: { id: source.id } },
-      children: [{
-        type: "tab",
-        tab: { children: [tabItem("EN", content.EN.slice(0, 100)), tabItem("JA", content.JA.slice(0, 100))] },
-      }],
-    }),
-  });
-  // The originals now live in their tab (children included, flattened)
-  for (const b of range) await deleteBlock(b.id);
+  const last = range[range.length - 1];
+  const { tabId, created } = await insertTabs(parentIdOf(top), last.id, content);
+
+  // The originals now live in their tab. Trashed, not destroyed: the
+  // restore log keeps their ids ("↩️ original").
+  for (const b of range) if (!skip.has(b.id)) await deleteBlock(b.id);
+  await logTranslation(pageId, plainText(sourceRich[0] || []), tabId, created, range.map((b) => b.id));
 }
 
 async function handlePageEvent(body) {
   const botId = await getBotId();
   if (body.authors?.length && body.authors.every((a) => a.id === botId)) return;
+  const pageId = body.entity?.id;
   for (const { id } of body.data?.updated_blocks || []) {
     try {
-      await handleBlock(id, botId);
+      await handleBlock(id, pageId, botId);
     } catch (err) {
       console.error(`block ${id} failed:`, err.message);
     }
